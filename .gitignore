@@ -1,0 +1,30 @@
+# ROS 2 / colcon build artifacts
+build/
+install/
+log/
+**/build/
+**/install/
+**/log/
+
+# Large source data and generated experiment outputs
+data/
+*.bag
+*.db3
+*.mcap
+*.zip
+*.z[0-9][0-9]
+
+# Local Python environments and caches
+.pydeps/
+.venv*/
+__pycache__/
+*.py[cod]
+
+# Local tool and editor state
+.agents/
+.claude/
+.evo/
+.evo_home/
+.mplconfig/
+.vscode/
+.~lock.*#

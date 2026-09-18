@@ -1,0 +1,75 @@
+/**:
+    ros__parameters:
+        feature_extract_enable: false
+        point_filter_num: 3
+        max_iteration: 3
+        filter_size_surf: 0.5
+        filter_size_map: 0.5
+        cube_side_length: 1000.0
+        runtime_pos_log_enable: false
+        map_file_path: "./test.pcd"
+
+        common:
+            lid_topic:  "/livox/lidar"
+            imu_topic:  "/livox/imu"
+            time_sync_en: false         # ONLY turn on when external time synchronization is really not possible
+            time_offset_lidar_to_imu: 0.0 # Time offset between lidar and IMU calibrated by other algorithms, e.g. LI-Init (can be found in README).
+                                        # This param will take effect no matter what time_sync_en is. So if the time offset is not known exactly, please set as 0.0
+
+        preprocess:
+            lidar_type: 4                # 1 for Livox serials LiDAR, 2 for Velodyne LiDAR, 3 for ouster LiDAR, 4 for any other pointcloud input
+            scan_line:  4
+            blind: 0.1
+            timestamp_unit: 3
+            scan_rate: 10
+
+        mapping:
+            acc_cov: 0.1
+            gyr_cov: 0.1
+            imu_trust_scale: 7.0  # >1.0 increases IMU process noise, so the filter trusts IMU less; 1.0 = stock FAST-LIO2 (no scaling)
+            b_acc_cov: 0.0001
+            b_gyr_cov: 0.0001
+            fov_degree:    360.0
+            det_range:     100.0
+            # Phased half-plane fine voxel downsampling.
+            # With filter_size_surf=0.5 and ADAPTIVE_FINE_VOXEL_SCALE=0.5 in code,
+            # the target half-plane below uses 0.25 m inside each [start,end) window;
+            # outside all windows, filter_size_surf (0.5 m) applies to the whole cloud as usual.
+            # target can be "front", "back", or "total" (total = whole cloud, not just one half-plane).
+            phased_halfplane_fine_voxel_enable: true
+            phased_halfplane_fine_voxel_leaf_size: 0.25  # explicit fine leaf size inside active phased windows; set <=0 to fall back to filter_size_surf * 0.5
+            #phased_halfplane_segments_start_times: [245.0]   
+            #phased_halfplane_segments_end_times: [300.0]
+
+            phased_halfplane_segments_start_times: [45.0]   #200s = 0s   
+            phased_halfplane_segments_end_times: [100.0]   
+            phased_halfplane_segments_targets: ["back"]     # <- "front" / "back" / "total" 중 선택
+            # Ramp (linear-interpolation) voxel-size transition for "total"-target
+            # phased_halfplane segments above, replacing the old hard step at segment
+            # start/end: eases from voxel_size_normal to voxel_size_fine over the
+            # voxel_ramp_duration seconds before/after each segment.
+            voxel_size_normal: 0.5
+            voxel_size_fine_enable: true  # false => "total"-target segments have no effect; voxel size stays voxel_size_normal (voxel_size_fine is ignored)
+            voxel_size_fine: 0.25
+            voxel_ramp_duration: 5.0
+            deskew_enable: true    # false => skip backward propagation (de-skew); forward propagation always runs
+            tum_trajectory_log_enable: true
+            tum_trajectory_log_path: "/home/jschoi/edit_fastlio2/IMU.tum"
+            extrinsic_est_en:  false      # true: enable the online estimation of IMU-LiDAR extrinsic
+            extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
+            extrinsic_R: [ 1., 0., 0.,
+                            0., 1., 0.,
+                            0., 0., 1.]
+
+        publish:
+            path_en: true                # true: publish Path
+            effect_map_en: false         # true: publish Effects
+            map_en: true                 # true: publish Map cloud
+            scan_publish_en:  true       # false: close all the point cloud output
+            dense_publish_en: false      # false: low down the points number in a global-frame point clouds scan.
+            scan_bodyframe_pub_en: true  # true: output the point cloud scans in IMU-body-frame
+
+        pcd_save:
+            pcd_save_en: true
+            interval: -1                 # how many LiDAR frames saved in each pcd file;
+                                        # -1 : all frames will be saved in ONE pcd file, may lead to memory crash when having too much frames.

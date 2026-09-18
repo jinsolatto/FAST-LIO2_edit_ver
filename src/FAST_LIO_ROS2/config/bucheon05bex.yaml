@@ -1,0 +1,107 @@
+/**:
+    ros__parameters:
+        feature_extract_enable: false
+        point_filter_num: 3
+        max_iteration: 3
+        filter_size_surf: 0.5
+        filter_size_map: 0.5
+        cube_side_length: 1000.0
+        runtime_pos_log_enable: false
+        map_file_path: "./test.pcd"
+
+        common:
+            lid_topic:  "/livox/lidar"
+            imu_topic:  "/livox/imu"
+            time_sync_en: false
+            time_offset_lidar_to_imu: 0.0
+
+        preprocess:
+            lidar_type: 1
+            scan_line:  4
+            blind: 0.5
+            timestamp_unit: 3
+            scan_rate: 10
+
+        mapping:
+            acc_cov: 0.1
+            gyr_cov: 0.1
+            imu_trust_scale: 1.0  # >1.0: trust IMU less
+            b_acc_cov: 0.0001
+            b_gyr_cov: 0.0001
+            fov_degree: 360.0
+            det_range: 100.0
+            # This config enables phased half-plane fine voxel downsampling.
+            # With filter_size_surf=0.5 and ADAPTIVE_FINE_VOXEL_SCALE=0.5 in code,
+            # the back half-plane uses 0.25 m from 35 s to 68 s,
+            # then the back half-plane uses 0.25 m from 75 s to 96 s,
+            # then the back half-plane uses 0.25 m from 102 s to 155 s.
+            # phase*_target can be "front", "back", or "total".
+            phased_halfplane_fine_voxel_enable: false
+            phased_halfplane_fine_voxel_leaf_size: 0.1  # target leaf size for the segment's targeted half-plane ("back" below); set <=0 to fall back to filter_size_surf * 0.5
+            phased_halfplane_other_leaf_size: -1.0  # <=0 => OTHER (untargeted, "front") half-plane falls back to voxel_size_normal (0.5) / the total-segment background
+            #phased_halfplane_segments_start_times: [315.0, 358.0, 380.0]
+            #phased_halfplane_segments_end_times: [357.0, 370.0, 400.0]
+            #phased_halfplane_segments_targets: ["back", "front", "back"]
+            # 0-460s: "total" segment -- whole cloud stays at voxel_size_fine (0.1 below);
+            # since this segment starts at t=0 there's no ramp-in, and its end (460s) is
+            # set to exactly match where the "back" segment's own ramp-in begins below, so
+            # the 460-465s window is a single, continuous ramp zone.
+            # 465s-end: "back" segment -- back half-plane ramps to phased_halfplane_fine_voxel_leaf_size
+            # (0.1 above); front half-plane stays at voxel_size_normal (0.5, phased_halfplane_other_leaf_size
+            # disabled above). End time is set far past the bag length so this segment never
+            # ramps back out.
+            # The 460-465s handoff is a single smooth transition (not a hard step): back
+            # inherits the "total" segment's ramp-out value at 460s and eases from there into
+            # its 465s target (0.1), so there is no jump on the back side at the boundary.
+            # (Both segments' ramps are gated by the shared voxel_size_fine_enable/
+            # voxel_ramp_duration below -- set voxel_size_fine_enable: false for either
+            # to fall back to the old hard step exactly at the segment boundary.)
+            phased_halfplane_segments_start_times: [0.0, 465.0]
+            phased_halfplane_segments_end_times: [460.0, 1000000000.0]
+            phased_halfplane_segments_targets: ["total", "back"]
+
+            # Ramp (linear-interpolation) voxel-size transition for "total"-target
+            # segments above, replacing the old hard step at segment start/end.
+            # voxel_size_normal must match filter_size_surf (0.5 above) so the
+            # baseline (outside every segment, or ramp_duration<=0) is unchanged.
+            voxel_size_normal: 0.5
+            voxel_size_fine_enable: true  # false => "total"-target segments have no effect; voxel size stays voxel_size_normal (voxel_size_fine is ignored)
+            voxel_size_fine: 0.1
+            voxel_ramp_duration: 5.0
+
+            # Time-windowed override of preprocess.blind (0.5 above). Global blind=0.3 was
+            # tried and made things much worse (front_effL collapsed to ~0, r_lambda_min
+            # crashed) -- disabled, preprocess.blind stays at its plain 0.5 default.
+            blind_window_enable: false
+            blind_window_start_time: 460.0
+            blind_window_end_time: 1000000000.0
+            blind_window_value: 0.3
+
+            # Time-windowed override of imu_trust_scale (>1.0 below). Tried at 0.3 for
+            # 460-470s to address the 467s rotation-near-wall drift; verified it did NOT
+            # help (r_lambda_min/t_lambda_min/eff_feat_num all came out slightly worse than
+            # baseline) -- disabled, kept for reference in case it's worth revisiting later.
+            imu_trust_window_enable: false
+            imu_trust_window_start_time: 460.0
+            imu_trust_window_end_time: 470.0
+            imu_trust_window_value: 0.3
+
+            tum_trajectory_log_enable: true
+            tum_trajectory_log_path: "/home/jschoi/edit_fastlio2/BUCHEON/bucheon05bex_reverted_verify/FAST-LIO2.tum"
+            extrinsic_est_en: false
+            extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
+            extrinsic_R: [ 1., 0., 0.,
+                            0., 1., 0.,
+                            0., 0., 1.]
+
+        publish:
+            path_en: true
+            effect_map_en: false
+            map_en: true
+            scan_publish_en: true
+            dense_publish_en: false
+            scan_bodyframe_pub_en: true
+
+        pcd_save:
+            pcd_save_en: false
+            interval: -1

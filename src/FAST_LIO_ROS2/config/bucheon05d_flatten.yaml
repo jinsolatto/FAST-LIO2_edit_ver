@@ -1,0 +1,63 @@
+/**:
+    ros__parameters:
+        feature_extract_enable: false
+        point_filter_num: 3
+        max_iteration: 3
+        filter_size_surf: 0.5 #0.5
+        filter_size_map: 0.5
+        cube_side_length: 1000.0
+        runtime_pos_log_enable: false
+        map_file_path: "./test.pcd"
+
+        common:
+            lid_topic:  "/livox/lidar"
+            imu_topic:  "/livox/imu"
+            time_sync_en: false
+            time_offset_lidar_to_imu: 0.0
+
+        preprocess:
+            lidar_type: 1
+            scan_line:  4
+            blind: 0.5
+            timestamp_unit: 3
+            scan_rate: 10
+
+        mapping:
+            acc_cov: 0.1
+            gyr_cov: 0.1
+            b_acc_cov: 0.0001
+            b_gyr_cov: 0.0001
+            fov_degree:    360.0
+            det_range:     100.0
+
+            # 2D-lidar-style pose flattening: while inside any [start,end] window
+            # below, z position, vertical velocity, and roll/pitch are forced to 0
+            # right after each scan's KF update (yaw kept), and the corrected state is
+            # written back into the filter so map insertion and the next scan's
+            # propagation both see it. Times match the physical disturbances observed
+            # replaying 05_d_minimize: the robot was lifted and set back down around
+            # 305-310s and 327-337s, and again around 370-373s.
+            flatten_pose_enable: true
+            flatten_pose_start_times: [305.0, 327.0, 370.0]
+            flatten_pose_end_times:   [310.0, 337.0, 373.0]
+
+            deskew_enable: true
+            tum_trajectory_log_enable: true
+            tum_trajectory_log_path: "/home/jschoi/edit_fastlio2/BUCHEON/bucheon_05d_flatten/FAST-LIO2.tum"
+            extrinsic_est_en:  false
+            extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
+            extrinsic_R: [ 1., 0., 0.,
+                            0., 1., 0.,
+                            0., 0., 1.]
+
+        publish:
+            path_en: true
+            effect_map_en: false
+            map_en: true
+            scan_publish_en:  true
+            dense_publish_en: false
+            scan_bodyframe_pub_en: true
+
+        pcd_save:
+            pcd_save_en: true
+            interval: -1

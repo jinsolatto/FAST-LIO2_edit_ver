@@ -1,0 +1,73 @@
+/**:
+    ros__parameters:
+        feature_extract_enable: false
+        point_filter_num: 3
+        max_iteration: 3
+        filter_size_surf: 0.5
+        filter_size_map: 0.5
+        cube_side_length: 1000.0
+        runtime_pos_log_enable: false
+        map_file_path: "./test.pcd"
+
+        common:
+            lid_topic:  "/livox/lidar"
+            imu_topic:  "/livox/imu"
+            time_sync_en: false
+            time_offset_lidar_to_imu: 0.0
+
+        preprocess:
+            lidar_type: 1
+            scan_line:  4
+            blind: 0.5
+            timestamp_unit: 3
+            scan_rate: 10
+
+        mapping:
+            acc_cov: 0.1
+            gyr_cov: 0.1
+            imu_trust_scale: 1.0  # >1.0: trust IMU less
+            b_acc_cov: 0.0001
+            b_gyr_cov: 0.0001
+            fov_degree: 360.0
+            det_range: 100.0
+            # This config enables phased half-plane fine voxel downsampling.
+            # With filter_size_surf=0.5 and ADAPTIVE_FINE_VOXEL_SCALE=0.5 in code,
+            # the back half-plane uses 0.25 m from 35 s to 68 s,
+            # then the back half-plane uses 0.25 m from 75 s to 96 s,
+            # then the back half-plane uses 0.25 m from 102 s to 155 s.
+            # phase*_target can be "front", "back", or "total".
+            phased_halfplane_fine_voxel_enable: true
+            phased_halfplane_fine_voxel_leaf_size: 0.25  # explicit fine leaf size inside active phased windows; set <=0 to fall back to filter_size_surf * 0.5
+            phased_halfplane_segments_start_times: [270.0, 295.0, 314.0]
+            #phased_halfplane_segments_start_times: [15.0, 40.0, 59.0] #255s=0s
+            #phased_halfplane_segments_end_times: [30.0, 58.0, 85.0]
+
+            phased_halfplane_segments_end_times: [285.0, 313.0, 340.0]
+            phased_halfplane_segments_targets: ["front", "back", "back"]
+            # Ramp (linear-interpolation) voxel-size transition for "total"-target
+            # phased_halfplane segments above, replacing the old hard step at segment
+            # start/end: eases from voxel_size_normal to voxel_size_fine over the
+            # voxel_ramp_duration seconds before/after each segment.
+            voxel_size_normal: 0.5
+            voxel_size_fine_enable: true  # false => "total"-target segments have no effect; voxel size stays voxel_size_normal (voxel_size_fine is ignored)
+            voxel_size_fine: 0.25
+            voxel_ramp_duration: 5.0
+            tum_trajectory_log_enable: true
+            tum_trajectory_log_path: "/home/jschoi/edit_fastlio2/custom.tum"
+            extrinsic_est_en: false
+            extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
+            extrinsic_R: [ 1., 0., 0.,
+                            0., 1., 0.,
+                            0., 0., 1.]
+
+        publish:
+            path_en: true
+            effect_map_en: false
+            map_en: true
+            scan_publish_en: true
+            dense_publish_en: false
+            scan_bodyframe_pub_en: true
+
+        pcd_save:
+            pcd_save_en: false
+            interval: -1
