@@ -276,7 +276,7 @@ public:
 	}
 
 	// iterated error state EKF propogation
-	void predict(double &dt, processnoisecovariance &Q, const input &i_in){
+	void predict(double &dt, processnoisecovariance &Q, const input &i_in, cov* transition_out = nullptr, Matrix<scalar_type, n, process_noise_dof>* noise_out = nullptr){
 		flatted_state f_ = f(x_, i_in);
 		cov_ f_x_ = f_x(x_, i_in);
 		cov f_x_final;
@@ -376,9 +376,13 @@ public:
 		spMt f_w1 = f_w_final.sparseView();
 		spMt xp = f_x_1 + f_x2 * dt;
 		P_ = xp * P_ * xp.transpose() + (f_w1 * dt) * Q * (f_w1 * dt).transpose();
+        if (transition_out) *transition_out = cov(xp);
+        if (noise_out) *noise_out = dt * f_w_final;
 	#else
 		F_x1 += f_x_final * dt;
 		P_ = (F_x1) * P_ * (F_x1).transpose() + (dt * f_w_final) * Q * (dt * f_w_final).transpose();
+        if (transition_out) *transition_out = F_x1;
+        if (noise_out) *noise_out = dt * f_w_final;
 	#endif
 	}
 

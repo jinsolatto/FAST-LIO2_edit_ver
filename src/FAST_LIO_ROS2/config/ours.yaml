@@ -1,0 +1,65 @@
+/**:
+    ros__parameters:
+        feature_extract_enable: false
+        point_filter_num: 3
+        max_iteration: 3
+        filter_size_surf: 0.2
+        filter_size_map: 0.5
+        # Match Siheung's local-map extent; this directly controls the map
+        # window used for scan matching.
+        cube_side_length: 960.0
+        runtime_pos_log_enable: false
+        map_file_path: "./ours_final_map.pcd"
+
+        common:
+            lid_topic: "/livox/lidar"
+            imu_topic: "/livox/imu"
+            time_sync_en: false
+            time_offset_lidar_to_imu: 0.0
+
+        preprocess:
+            lidar_type: 4
+            scan_line: 4
+            blind: 0.5
+            timestamp_unit: 3
+            scan_rate: 10
+
+        mapping:
+            acc_cov: 0.1
+            gyr_cov: 0.1
+            b_acc_cov: 0.0001
+            b_gyr_cov: 0.0001
+            fov_degree: 360.0
+            det_range: 100.0
+            # Baseline (normal IMU cadence): Mid360 behavior.
+            deskew_enable: true
+            imu_trust_scale: 1.0
+            # Detect low cadence with a short 0.1 s window and 0.01 s hold.
+            # Keep recovery slow: require >100 Hz continuously for 3 s.
+            imu_rate_adaptive_enable: true
+            imu_rate_low_hz_threshold: 100.0
+            imu_rate_observation_window_sec: 0.1
+            imu_rate_low_hold_sec: 0.01
+            imu_rate_recovery_hold_sec: 3.0
+            imu_rate_low_imu_trust_scale: 7.0
+            extrinsic_est_en: false
+            extrinsic_T: [ -0.011, -0.02329, 0.04412 ]
+            extrinsic_R: [ 1., 0., 0.,
+                            0., 1., 0.,
+                            0., 0., 1. ]
+            pose_trajectory_log_enable: true
+            pose_trajectory_log_path: "/tmp/fastlio_ours_pose.txt"
+            tum_trajectory_log_enable: true
+            tum_trajectory_log_path: "/tmp/fastlio_ours_trajectory.tum"
+
+        publish:
+            path_en: true
+            effect_map_en: false
+            map_en: true
+            scan_publish_en: true
+            dense_publish_en: false
+            scan_bodyframe_pub_en: true
+
+        pcd_save:
+            pcd_save_en: false
+            interval: -1

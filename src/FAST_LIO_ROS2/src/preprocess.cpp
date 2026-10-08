@@ -1,6 +1,9 @@
 #include "preprocess.h"
 
 #include <pcl/common/common.h>
+#include <algorithm>
+#include <cstring>
+#include <limits>
 
 #define RETURN0 0x00
 #define RETURN0AND1 0x10
@@ -537,6 +540,53 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
   pl_corn.clear();
   pl_full.clear();
 
+  // PointCloud2 `timestamp` is an absolute sensor time in timestamp_unit.
+  // Read it directly: LivoxPointXyzitl intentionally has no timestamp member.
+  // Preserve the legacy path only for messages without this field.
+  const auto stamp_field = std::find_if(msg->fields.begin(), msg->fields.end(),
+      [](const sensor_msgs::msg::PointField &f) { return f.name == "timestamp"; });
+  std::vector<float> measured_offsets;
+  if (stamp_field != msg->fields.end())
+  {
+    const uint16_t endian_probe = 1;
+    const bool host_bigendian = *reinterpret_cast<const uint8_t *>(&endian_probe) == 0;
+    const size_t count = size_t(msg->width) * msg->height;
+    if (stamp_field->datatype != sensor_msgs::msg::PointField::FLOAT64 ||
+        stamp_field->count != 1 ||
+        size_t(stamp_field->offset) + sizeof(double) > msg->point_step ||
+        size_t(msg->row_step) < size_t(msg->width) * msg->point_step ||
+        size_t(msg->row_step) * msg->height > msg->data.size())
+    {
+      RCLCPP_ERROR(rclcpp::get_logger("preprocess"), "Invalid MID360 timestamp field/layout; rejecting cloud");
+      return;
+    }
+    // Use double constants, not the float time_unit_scale: rounding an epoch
+    // conversion scale in float would introduce seconds of timestamp error.
+    const double units_per_second = time_unit == SEC ? 1.0 : time_unit == MS ? 1e3 :
+                                    time_unit == US ? 1e6 : time_unit == NS ? 1e9 : 0.0;
+    const double header_units = (double(msg->header.stamp.sec) * units_per_second) +
+                               double(msg->header.stamp.nanosec) * (units_per_second / 1e9);
+    measured_offsets.reserve(count);
+    for (size_t row = 0; row < msg->height; ++row)
+      for (size_t col = 0; col < msg->width; ++col)
+      {
+        uint8_t bytes[sizeof(double)];
+        std::memcpy(bytes, msg->data.data() + row * msg->row_step + col * msg->point_step + stamp_field->offset, sizeof(double));
+        if (host_bigendian != msg->is_bigendian) std::reverse(bytes, bytes + sizeof(double));
+        double stamp;
+        std::memcpy(&stamp, bytes, sizeof(double));
+        const double offset_ms = (stamp - header_units) * (1000.0 / units_per_second);
+        // Permit only floating-point epoch quantization before the header.
+        const double tolerance_ms = std::max(0.001, 2.0 * std::numeric_limits<double>::epsilon() * std::abs(header_units) * (1000.0 / units_per_second));
+        if (!std::isfinite(offset_ms) || units_per_second == 0.0 || offset_ms < -tolerance_ms || offset_ms > 1000.0)
+        {
+          RCLCPP_ERROR(rclcpp::get_logger("preprocess"), "MID360 timestamp is not an absolute time near header in configured timestamp_unit; rejecting cloud");
+          return;
+        }
+        measured_offsets.push_back(float(std::max(0.0, offset_ms)));
+      }
+  }
+
   pcl::PointCloud<livox_ros::LivoxPointXyzitl> pl_orig;
   pcl::fromROSMsg(*msg, pl_orig);
   int plsize = pl_orig.points.size();
@@ -549,6 +599,30 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
   const bool front_reject_active = front_reject_enable &&
                                    scan_relative_time >= FRONT_REJECT_START_TIME &&
                                    scan_relative_time <= FRONT_REJECT_END_TIME;
+
+  if (stamp_field != msg->fields.end())
+  {
+    given_offset_time = true;
+    for (size_t i = 0; i < pl_orig.size(); ++i)
+    {
+      const auto &p = pl_orig[i];
+      const bool front = p.x >= 0.0;
+      if (front) ++front_raw_point_count; else ++back_raw_point_count;
+      if (front_reject_active && front) { ++front_points_rejected; continue; }
+      if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z) ||
+          p.x*p.x + p.y*p.y + p.z*p.z <= blind*blind)
+      { ++blind_points_rejected; continue; }
+      PointType point;
+      point.x = p.x; point.y = p.y; point.z = p.z;
+      point.intensity = p.intensity;
+      point.normal_x = point.normal_y = point.normal_z = 0.0f;
+      point.curvature = measured_offsets[i]; // milliseconds, used by sync and deskew
+      pl_surf.push_back(point);
+    }
+    std::stable_sort(pl_surf.begin(), pl_surf.end(),
+        [](const PointType &a, const PointType &b) { return a.curvature < b.curvature; });
+    return;
+  }
 
   /*** These variables only works when no point timestamps given ***/
   double omega_l = 0.361 * SCAN_RATE;  // scan angular velocity

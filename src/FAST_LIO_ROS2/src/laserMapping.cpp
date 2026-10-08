@@ -59,6 +59,10 @@
 #include <Eigen/Core>
 #include <Eigen/Eigenvalues>
 #include "IMU_Processing.hpp"
+#include "GapConsistencyAudit.hpp"
+GapConsistencyAudit g_gap_consistency;
+bool g_gap_first_evaluation_logged=false;
+#include "imu_propagation_experiment.hpp"
 #include "voxel_plane_shadow.hpp"
 #include "vslam_port/voxel_map.hpp"
 #include <nav_msgs/msg/odometry.hpp>
@@ -114,6 +118,15 @@ bool imu_trust_window_enable = false; // true => use imu_trust_window_value inst
 double imu_trust_window_start_time = 0.0;
 double imu_trust_window_end_time = 1.0e9;
 double imu_trust_window_value = 1.0; // <1.0 => trust IMU MORE than imu_trust_scale during the window (lower process noise -> lidar update pulls less)
+bool imu_trust_window_use_ros_time = false;
+double imu_trust_window_time_origin = 0.0;
+bool imu_rate_adaptive_enable = false;
+// Opt-in safety for sparse IMU replay; baseline configs retain their behavior.
+double imu_rate_low_hz_threshold = 100.0;
+double imu_rate_observation_window_sec = 1.0;
+double imu_rate_low_hold_sec = 3.0;
+double imu_rate_recovery_hold_sec = 3.0;
+double imu_rate_low_imu_trust_scale = 7.0;
 double filter_size_corner_min = 0, filter_size_surf_min = 0, filter_size_map_min = 0, fov_deg = 0;
 double cube_len = 0, HALF_FOV_COS = 0, FOV_DEG = 0, total_distance = 0, lidar_end_time = 0, first_lidar_time = 0.0;
 int    effct_feat_num = 0, time_log_counter = 0, scan_count = 0, publish_count = 0;
@@ -127,30 +140,10 @@ bool   tum_trajectory_log_enable = false;
 bool   pose_trajectory_log_enable = false;
 double imu_degraded_dt_threshold_ms = 15.0;
 double lidar_weak_rotation_threshold = -1.0; // <=0 => unset: run once to inspect the r_lambda_min column, then set explicitly
-constexpr double ADAPTIVE_FINE_VOXEL_SCALE = 0.5;
 bool deskew_enable = true; // false => skip backward propagation (de-skew) in UndistortPcl; forward propagation (predict) always runs
 bool front_reject_enable = false; // true => drop all front-hemisphere (+X) raw points inside the window below
 double FRONT_REJECT_START_TIME = 260.0;
 double FRONT_REJECT_END_TIME = 390.0;
-bool phased_halfplane_fine_voxel_enable = false; // true => switch fine voxel target half-plane by time window
-double phased_halfplane_fine_voxel_leaf_size = -1.0; // <= 0 uses filter_size_surf * ADAPTIVE_FINE_VOXEL_SCALE
-double phased_halfplane_other_leaf_size = -1.0; // <=0 => untargeted half-plane uses voxel_normal/total-background as before; >0 => it also ramps toward this value instead
-double phased_halfplane_back_start_time = 20.0;
-double phased_halfplane_back_end_time = 65.0;
-double phased_halfplane_front_start_time = 66.0;
-double phased_halfplane_front_end_time = 87.0;
-double phased_halfplane_back_resume_start_time = 88.0;
-double phased_halfplane_back_resume_end_time = 1.0e9;
-string phased_halfplane_phase1_target = "back";
-string phased_halfplane_phase2_target = "front";
-string phased_halfplane_phase3_target = "back";
-struct FineVoxelSegment
-{
-    double start_time = 0.0;
-    double end_time = 0.0;
-    string target = "back";
-};
-std::vector<FineVoxelSegment> phased_halfplane_segments;
 bool windowed_voxel_enable = false; // true => use windowed_voxel_leaf_size instead of filter_size_surf inside the window below
 double windowed_voxel_start_time = 290.0;
 double windowed_voxel_end_time = 296.0;
@@ -160,15 +153,6 @@ bool blind_window_enable = false; // true => use blind_window_value instead of p
 double blind_window_start_time = 0.0;
 double blind_window_end_time = 1.0e9;
 double blind_window_value = 0.01;
-// Ramp (linear-interpolation) voxel-size transition for "total"-target phased_halfplane
-// segments, replacing the old hard step at segment_start/segment_end. <=0 sentinels fall
-// back to the pre-existing values (filter_size_surf_min / resolve_fine_voxel_leaf_size)
-// so this is opt-in and never silently drifts from the stock leaf size.
-double voxel_size_normal = -1.0;   // <=0 => use active_surf_leaf_size (filter_size_surf_min or windowed override)
-bool voxel_size_fine_enable = true; // false => "total"-target segments have no effect at all; voxel size stays voxel_size_normal throughout (voxel_size_fine is ignored)
-double voxel_size_fine = -1.0;     // <=0 => use resolve_fine_voxel_leaf_size(active_surf_leaf_size)
-double voxel_ramp_duration = 0.0;  // seconds; 0 => identical to the old hard step (regression case)
-
 // IMU-only windows: while relative_time falls inside any window below, the LiDAR
 // measurement update (kf.update_iterated_dyn_share_modified) is skipped entirely for
 // that scan, so the state stays at whatever the IMU-only forward propagation already
@@ -440,6 +424,36 @@ struct DegeneracyResult
     bool early_warning = false;
 };
 DegeneracyResult latest_degeneracy_result;
+
+// --- Analysis-only instrumentation: scan-to-map registration quality (PRE/POST RMSE) ---
+// Read-only w.r.t. the estimator: nothing here feeds back into state estimation,
+// correspondence selection, or the EKF update. See h_share_model() and
+// compute_post_scan2map_rmse() for where these are filled in.
+//   PRE  = point-to-plane residual RMSE from the FIRST h_share_model() call of a
+//          scan's IEKF loop, i.e. correspondences built from the IMU-propagated
+//          state, before any LiDAR correction is applied this scan.
+//   POST = the SAME correspondence set as the LAST h_share_model() call this scan
+//          (the one whose Jacobian/residual the IEKF actually converged on),
+//          re-evaluated at the final state returned by kf.get_x().
+int    g_h_share_calls_this_scan       = 0;
+#ifdef FASTLIO_ABLATION_REPLAY
+// Test executable only: read-only snapshot immediately before LiDAR correction.
+state_ikfom g_ablation_predicted_state;
+double g_ablation_pre_position_cov = NAN, g_ablation_pre_rotation_cov = NAN, g_ablation_pre_velocity_cov = NAN;
+#endif
+long   g_frame_id_counter              = 0;
+int    g_pre_valid_count               = 0;
+double g_pre_scan2map_rmse             = std::numeric_limits<double>::quiet_NaN();
+double g_pre_mean_abs_residual         = std::numeric_limits<double>::quiet_NaN();
+int    g_post_valid_count              = 0;
+double g_post_scan2map_rmse            = std::numeric_limits<double>::quiet_NaN();
+double g_post_mean_abs_residual        = std::numeric_limits<double>::quiet_NaN();
+// Literal implementation of the experiment's stated rule: normalized_min_eigenvalue
+// (== lambda_min_norm) <= 0.12 for 4 consecutive LiDAR frames. Deliberately separate
+// from the existing persistent_degenerate flag below, which uses a different
+// 7-of-10-frame sliding-window rule -- kept untouched.
+int g_consecutive_lambda_degenerate    = 0;
+
 // Stage-0 shadow comparison only: built/queried alongside the real pipeline,
 // never fed into the EKF. See voxel_plane_shadow.hpp.
 voxel_shadow::ShadowVoxelMap g_shadow_voxel_map;
@@ -607,11 +621,6 @@ inline int azimuth_quadrant(const PointType &point)
     return azimuth_quadrant_from_wrapped(azimuth_deg_wrapped(point));
 }
 
-inline int azimuth_halfplane_from_wrapped(double wrapped_deg)
-{
-    return (wrapped_deg <= 90.0 || wrapped_deg >= 270.0) ? 0 : 1;
-}
-
 inline bool use_windowed_voxel_window(double scan_relative_time)
 {
     return windowed_voxel_enable &&
@@ -648,78 +657,6 @@ inline bool use_imu_trust_window(double relative_time)
     return imu_trust_window_enable &&
            relative_time >= imu_trust_window_start_time &&
            relative_time <= imu_trust_window_end_time;
-}
-
-inline bool use_back_halfplane_fine_voxel_window(double scan_relative_time)
-{
-    return phased_halfplane_fine_voxel_enable &&
-           scan_relative_time >= phased_halfplane_back_start_time &&
-           scan_relative_time <= phased_halfplane_back_end_time;
-}
-
-inline bool use_back_halfplane_fine_voxel_resume_window(double scan_relative_time)
-{
-    return phased_halfplane_fine_voxel_enable &&
-           scan_relative_time >= phased_halfplane_back_resume_start_time &&
-           scan_relative_time <= phased_halfplane_back_resume_end_time;
-}
-
-inline bool use_front_halfplane_fine_voxel_window(double scan_relative_time)
-{
-    return phased_halfplane_fine_voxel_enable &&
-           scan_relative_time >= phased_halfplane_front_start_time &&
-           scan_relative_time <= phased_halfplane_front_end_time;
-}
-
-inline bool get_active_fine_voxel_segment(double scan_relative_time, FineVoxelSegment &active_segment)
-{
-    if (!phased_halfplane_fine_voxel_enable)
-    {
-        return false;
-    }
-
-    for (auto it = phased_halfplane_segments.rbegin(); it != phased_halfplane_segments.rend(); ++it)
-    {
-        if (scan_relative_time >= it->start_time &&
-            scan_relative_time <= it->end_time)
-        {
-            active_segment = *it;
-            return true;
-        }
-    }
-
-    return false;
-}
-
-inline bool is_front_halfplane_target(const std::string &target)
-{
-    return target == "front" || target == "Front" || target == "FRONT";
-}
-
-inline bool is_back_halfplane_target(const std::string &target)
-{
-    return target == "back" || target == "Back" || target == "BACK";
-}
-
-inline bool is_total_halfplane_target(const std::string &target)
-{
-    return target == "total" || target == "Total" || target == "TOTAL";
-}
-
-inline void rebuild_legacy_fine_voxel_segments()
-{
-    phased_halfplane_segments.clear();
-    if (!phased_halfplane_fine_voxel_enable)
-    {
-        return;
-    }
-
-    phased_halfplane_segments.push_back(
-        {phased_halfplane_back_start_time, phased_halfplane_back_end_time, phased_halfplane_phase1_target});
-    phased_halfplane_segments.push_back(
-        {phased_halfplane_front_start_time, phased_halfplane_front_end_time, phased_halfplane_phase2_target});
-    phased_halfplane_segments.push_back(
-        {phased_halfplane_back_resume_start_time, phased_halfplane_back_resume_end_time, phased_halfplane_phase3_target});
 }
 
 inline int argmax_quadrant(const std::array<double, 4> &values)
@@ -834,128 +771,6 @@ inline AdaptiveSectorSelection analyze_adaptive_sector_selection(const PointClou
     selection.translation_sector = argmax_quadrant(selection.translation_contrib);
     selection.rotation_sector = argmax_quadrant(selection.rotation_contrib);
     return selection;
-}
-
-inline void downsample_target_halfplane_with_fine_voxel(const PointCloudXYZI::Ptr &input_cloud,
-                                                        PointCloudXYZI::Ptr &output_cloud,
-                                                        double base_leaf_size,
-                                                        double fine_leaf_size,
-                                                        bool target_front_halfplane)
-{
-    PointCloudXYZI::Ptr front_cloud(new PointCloudXYZI());
-    PointCloudXYZI::Ptr back_cloud(new PointCloudXYZI());
-    for (const auto &point : input_cloud->points)
-    {
-        const int halfplane = azimuth_halfplane_from_wrapped(azimuth_deg_wrapped(point));
-        if (halfplane == 0)
-        {
-            front_cloud->points.push_back(point);
-        }
-        else
-        {
-            back_cloud->points.push_back(point);
-        }
-    }
-
-    PointCloudXYZI front_down;
-    PointCloudXYZI back_down;
-    pcl::VoxelGrid<PointType> filter;
-
-    if (!front_cloud->empty())
-    {
-        const double front_leaf_size = target_front_halfplane ? fine_leaf_size : base_leaf_size;
-        filter.setLeafSize(front_leaf_size, front_leaf_size, front_leaf_size);
-        filter.setInputCloud(front_cloud);
-        filter.filter(front_down);
-    }
-
-    if (!back_cloud->empty())
-    {
-        const double back_leaf_size = target_front_halfplane ? base_leaf_size : fine_leaf_size;
-        filter.setLeafSize(back_leaf_size, back_leaf_size, back_leaf_size);
-        filter.setInputCloud(back_cloud);
-        filter.filter(back_down);
-    }
-
-    output_cloud->clear();
-    output_cloud->points.reserve(front_down.points.size() + back_down.points.size());
-    output_cloud->points.insert(output_cloud->points.end(), front_down.points.begin(), front_down.points.end());
-    output_cloud->points.insert(output_cloud->points.end(), back_down.points.begin(), back_down.points.end());
-    output_cloud->width = output_cloud->points.size();
-    output_cloud->height = 1;
-    output_cloud->is_dense = true;
-}
-
-inline void downsample_total_with_fine_voxel(const PointCloudXYZI::Ptr &input_cloud,
-                                             PointCloudXYZI::Ptr &output_cloud,
-                                             double fine_leaf_size)
-{
-    pcl::VoxelGrid<PointType> filter;
-    filter.setLeafSize(fine_leaf_size, fine_leaf_size, fine_leaf_size);
-    filter.setInputCloud(input_cloud);
-    filter.filter(*output_cloud);
-}
-
-inline double resolve_fine_voxel_leaf_size(double base_leaf_size)
-{
-    const double configured_leaf_size = (phased_halfplane_fine_voxel_leaf_size > 0.0)
-                                            ? phased_halfplane_fine_voxel_leaf_size
-                                            : (base_leaf_size * ADAPTIVE_FINE_VOXEL_SCALE);
-    return std::max(configured_leaf_size, 1e-3);
-}
-
-// Linear ramp (0=normal, 1=fine) for a single segment: rises over
-// [segment_start-ramp_duration, segment_start], holds at 1 for
-// [segment_start, segment_end], falls over [segment_end, segment_end+ramp_duration].
-// ramp_duration<=0 degenerates to the old hard step (alpha is 0 or 1 only), which is
-// the regression case required to reproduce pre-ramp behavior exactly.
-inline double compute_voxel_size(double current_time,
-                                 double segment_start, double segment_end,
-                                 double voxel_normal, double voxel_fine,
-                                 double ramp_duration)
-{
-    double alpha;
-    if (ramp_duration <= 0.0)
-    {
-        alpha = (current_time >= segment_start && current_time <= segment_end) ? 1.0 : 0.0;
-    }
-    else if (current_time < segment_start)
-    {
-        alpha = (current_time - (segment_start - ramp_duration)) / ramp_duration;
-    }
-    else if (current_time <= segment_end)
-    {
-        alpha = 1.0;
-    }
-    else
-    {
-        alpha = 1.0 - (current_time - segment_end) / ramp_duration;
-    }
-    alpha = std::min(1.0, std::max(0.0, alpha));
-    return voxel_normal - (voxel_normal - voxel_fine) * alpha;
-}
-
-// Evaluates the ramp across every "total"-target segment (front/back-target segments
-// are left to the pre-existing downsample_target_halfplane_with_fine_voxel path, which
-// this ramp does not touch) and keeps the finest (smallest) result, so overlapping ramps
-// resolve to whichever segment wants the denser cloud at that instant.
-inline double compute_voxel_size(double current_time,
-                                 const std::vector<FineVoxelSegment> &segments,
-                                 double voxel_normal, double voxel_fine,
-                                 double ramp_duration)
-{
-    double result = voxel_normal;
-    for (const auto &seg : segments)
-    {
-        if (!is_total_halfplane_target(seg.target))
-        {
-            continue;
-        }
-        const double v = compute_voxel_size(current_time, seg.start_time, seg.end_time,
-                                            voxel_normal, voxel_fine, ramp_duration);
-        result = std::min(result, v);
-    }
-    return result;
 }
 
 void SigHandle(int sig)
@@ -1745,6 +1560,30 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         }
     }
 
+    // Analysis-only: capture PRE scan-to-map RMSE on the first h_share_model()
+    // call of this scan only (ekfom_data.converge == true on scan entry, so this
+    // runs against the fresh IMU-propagated state, before any correction this
+    // scan). Reuses corr_normvect->points[i].intensity, which is exactly pd2 =
+    // n^T*(p-q), the same residual esekfom.hpp turns into h(i) below -- nothing
+    // new is computed, and no existing variable is modified.
+    if (g_h_share_calls_this_scan == 0)
+    {
+        double pre_sumsq = 0.0;
+        for (int i = 0; i < effct_feat_num; i++)
+        {
+            const double r = corr_normvect->points[i].intensity;
+            pre_sumsq += r * r;
+        }
+        g_pre_valid_count = effct_feat_num;
+        g_pre_scan2map_rmse = effct_feat_num > 0
+                                   ? std::sqrt(pre_sumsq / effct_feat_num)
+                                   : std::numeric_limits<double>::quiet_NaN();
+        g_pre_mean_abs_residual = effct_feat_num > 0
+                                       ? total_residual / effct_feat_num
+                                       : std::numeric_limits<double>::quiet_NaN();
+    }
+    g_h_share_calls_this_scan++;
+
     // Use exactly the point-to-plane correspondences retained for this EKF
     // iteration. Do not write the CSV here: this function can run repeatedly
     // for one LiDAR scan.
@@ -1827,14 +1666,61 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
         /*** Measuremnt: distance to the closest surface/corner ***/
         ekfom_data.h(i) = -norm_p.intensity * w;
     }
+    if(g_gap_consistency.enabled && g_h_share_calls_this_scan==1) {
+        g_gap_consistency.innovation(ekfom_data.h_x,ekfom_data.h,LASER_POINT_COV);
+        g_gap_first_evaluation_logged=true;
+    }
     solve_time += omp_get_wtime() - solve_start_;
+}
+
+// Analysis-only: POST scan-to-map RMSE. Re-evaluates the point-to-plane
+// residual r_i = plane_normal_i . (s_final.rot * point_body_i + s_final.pos)
+// + plane_d_i for the correspondence set latest_local_ba_constraints already
+// built by the LAST h_share_model() call this scan (the one the IEKF actually
+// converged on), but now at the truly final state s_final = kf.get_x() taken
+// after update_iterated_dyn_share_modified() returns. This intentionally
+// reuses the existing last-iteration set rather than re-running nearest-
+// neighbor/voxel search. PRE uses the FIRST iteration's set; thus PRE and POST
+// can differ in correspondences as well as pose. Purely read-only: does not touch
+// ikdtree/voxel map, Nearest_Points, point_selected_surf, or any EKF state.
+static void compute_post_scan2map_rmse(const state_ikfom &s_final,
+                                        double &out_rmse,
+                                        double &out_mean_abs,
+                                        int &out_count)
+{
+    out_count = static_cast<int>(latest_local_ba_constraints.size());
+    if (out_count == 0)
+    {
+        out_rmse = std::numeric_limits<double>::quiet_NaN();
+        out_mean_abs = std::numeric_limits<double>::quiet_NaN();
+        return;
+    }
+    double sumsq = 0.0, sumabs = 0.0;
+    for (const auto &c : latest_local_ba_constraints)
+    {
+        const Eigen::Vector3d p_world = s_final.rot * c.point_body + s_final.pos;
+        const double r = c.plane_normal.dot(p_world) + c.plane_d;
+        sumsq += r * r;
+        sumabs += std::fabs(r);
+    }
+    out_rmse = std::sqrt(sumsq / out_count);
+    out_mean_abs = sumabs / out_count;
 }
 
 class LaserMappingNode : public rclcpp::Node
 {
+    friend class ImuExperimentReplay; // Deterministic bag regression harness only.
 public:
     LaserMappingNode(const rclcpp::NodeOptions& options = rclcpp::NodeOptions()) : Node("laser_mapping", options)
     {
+        const bool experiment_enabled = this->declare_parameter<bool>("imu_propagation_experiment.enable", false);
+        ImuPropagationExperiment::Options experiment_options;
+        experiment_options.reference_rate = this->declare_parameter<double>("imu_propagation_experiment.reference_rate", 200.);
+        experiment_options.target_rates = this->declare_parameter<std::vector<double>>("imu_propagation_experiment.target_rates", {100.,50.,20.});
+        experiment_options.output_csv = this->declare_parameter<std::string>("imu_propagation_experiment.output_csv", "/tmp/imu_propagation_error.csv");
+        experiment_options.trajectory_sample_dt = this->declare_parameter<double>("imu_propagation_experiment.trajectory_sample_dt", 0.005);
+        if (experiment_enabled)
+            imu_propagation_experiment_ = std::make_unique<ImuPropagationExperiment>(experiment_options);
         this->declare_parameter<bool>("publish.path_en", true);
         this->declare_parameter<bool>("publish.effect_map_en", false);
         this->declare_parameter<bool>("publish.map_en", false);
@@ -1858,6 +1744,12 @@ public:
         this->declare_parameter<double>("mapping.b_gyr_cov", 0.0001);
         this->declare_parameter<double>("mapping.b_acc_cov", 0.0001);
         this->declare_parameter<double>("mapping.imu_trust_scale", 1.0);
+        this->declare_parameter<bool>("mapping.imu_rate_adaptive_enable", false);
+        this->declare_parameter<double>("mapping.imu_rate_low_hz_threshold", 100.0);
+        this->declare_parameter<double>("mapping.imu_rate_observation_window_sec", 1.0);
+        this->declare_parameter<double>("mapping.imu_rate_low_hold_sec", 3.0);
+        this->declare_parameter<double>("mapping.imu_rate_recovery_hold_sec", 3.0);
+        this->declare_parameter<double>("mapping.imu_rate_low_imu_trust_scale", 7.0);
         this->declare_parameter<double>("preprocess.blind", 0.01);
         this->declare_parameter<int>("preprocess.lidar_type", AVIA);
         this->declare_parameter<int>("preprocess.scan_line", 16);
@@ -1907,25 +1799,6 @@ public:
         this->declare_parameter<bool>("mapping.front_reject_enable", false);
         this->declare_parameter<double>("mapping.front_reject_start_time", 260.0);
         this->declare_parameter<double>("mapping.front_reject_end_time", 390.0);
-        this->declare_parameter<bool>("mapping.phased_halfplane_fine_voxel_enable", false);
-        this->declare_parameter<double>("mapping.phased_halfplane_fine_voxel_leaf_size", -1.0);
-        this->declare_parameter<double>("mapping.phased_halfplane_other_leaf_size", -1.0);
-        this->declare_parameter<double>("mapping.phased_halfplane_back_start_time", 20.0);
-        this->declare_parameter<double>("mapping.phased_halfplane_back_end_time", 65.0);
-        this->declare_parameter<double>("mapping.phased_halfplane_front_start_time", 66.0);
-        this->declare_parameter<double>("mapping.phased_halfplane_front_end_time", 87.0);
-        this->declare_parameter<double>("mapping.phased_halfplane_back_resume_start_time", 88.0);
-        this->declare_parameter<double>("mapping.phased_halfplane_back_resume_end_time", 1.0e9);
-        this->declare_parameter<string>("mapping.phased_halfplane_phase1_target", "back");
-        this->declare_parameter<string>("mapping.phased_halfplane_phase2_target", "front");
-        this->declare_parameter<string>("mapping.phased_halfplane_phase3_target", "back");
-        this->declare_parameter<vector<double>>("mapping.phased_halfplane_segments_start_times", vector<double>());
-        this->declare_parameter<vector<double>>("mapping.phased_halfplane_segments_end_times", vector<double>());
-        this->declare_parameter<vector<string>>("mapping.phased_halfplane_segments_targets", vector<string>());
-        this->declare_parameter<double>("mapping.voxel_size_normal", -1.0);
-        this->declare_parameter<bool>("mapping.voxel_size_fine_enable", true);
-        this->declare_parameter<double>("mapping.voxel_size_fine", -1.0);
-        this->declare_parameter<double>("mapping.voxel_ramp_duration", 0.0);
         this->declare_parameter<bool>("mapping.windowed_voxel_enable", false);
         this->declare_parameter<double>("mapping.windowed_voxel_start_time", 290.0);
         this->declare_parameter<double>("mapping.windowed_voxel_end_time", 296.0);
@@ -1938,6 +1811,8 @@ public:
         this->declare_parameter<vector<double>>("mapping.imu_only_start_times", vector<double>());
         this->declare_parameter<vector<double>>("mapping.imu_only_end_times", vector<double>());
         this->declare_parameter<bool>("mapping.imu_trust_window_enable", false);
+        this->declare_parameter<bool>("mapping.imu_trust_window_use_ros_time", false);
+        this->declare_parameter<double>("mapping.imu_trust_window_time_origin", 0.0);
         this->declare_parameter<double>("mapping.imu_trust_window_start_time", 0.0);
         this->declare_parameter<double>("mapping.imu_trust_window_end_time", 1.0e9);
         this->declare_parameter<double>("mapping.imu_trust_window_value", 1.0);
@@ -1983,6 +1858,20 @@ public:
                         "mapping.imu_trust_scale must be positive; using 1.0 instead of %.6f",
                         imu_trust_scale);
             imu_trust_scale = 1.0;
+        }
+        this->get_parameter_or<bool>("mapping.imu_rate_adaptive_enable", imu_rate_adaptive_enable, false);
+        this->get_parameter_or<double>("mapping.imu_rate_low_hz_threshold", imu_rate_low_hz_threshold, 100.0);
+        this->get_parameter_or<double>("mapping.imu_rate_observation_window_sec", imu_rate_observation_window_sec, 1.0);
+        this->get_parameter_or<double>("mapping.imu_rate_low_hold_sec", imu_rate_low_hold_sec, 3.0);
+        this->get_parameter_or<double>("mapping.imu_rate_recovery_hold_sec", imu_rate_recovery_hold_sec, 3.0);
+        this->get_parameter_or<double>("mapping.imu_rate_low_imu_trust_scale", imu_rate_low_imu_trust_scale, 7.0);
+        if (imu_rate_low_hz_threshold <= 0.0 || imu_rate_observation_window_sec <= 0.0 ||
+            imu_rate_low_hold_sec <= 0.0 ||
+            imu_rate_recovery_hold_sec <= 0.0 || imu_rate_low_imu_trust_scale <= 0.0)
+        {
+            RCLCPP_WARN(this->get_logger(),
+                        "Invalid IMU-rate adaptive settings; disabling IMU-rate adaptation");
+            imu_rate_adaptive_enable = false;
         }
         this->get_parameter_or<double>("preprocess.blind", blind_default_value, 0.01);
         p_pre->blind = blind_default_value; // overridden dynamically per-scan in the lidar callbacks if blind_window_enable
@@ -2089,28 +1978,6 @@ public:
         this->get_parameter_or<bool>("mapping.front_reject_enable", front_reject_enable, false);
         this->get_parameter_or<double>("mapping.front_reject_start_time", FRONT_REJECT_START_TIME, 260.0);
         this->get_parameter_or<double>("mapping.front_reject_end_time", FRONT_REJECT_END_TIME, 390.0);
-        this->get_parameter_or<bool>("mapping.phased_halfplane_fine_voxel_enable", phased_halfplane_fine_voxel_enable, false);
-        this->get_parameter_or<double>("mapping.phased_halfplane_fine_voxel_leaf_size", phased_halfplane_fine_voxel_leaf_size, -1.0);
-        this->get_parameter_or<double>("mapping.phased_halfplane_other_leaf_size", phased_halfplane_other_leaf_size, -1.0);
-        this->get_parameter_or<double>("mapping.phased_halfplane_back_start_time", phased_halfplane_back_start_time, 20.0);
-        this->get_parameter_or<double>("mapping.phased_halfplane_back_end_time", phased_halfplane_back_end_time, 65.0);
-        this->get_parameter_or<double>("mapping.phased_halfplane_front_start_time", phased_halfplane_front_start_time, 66.0);
-        this->get_parameter_or<double>("mapping.phased_halfplane_front_end_time", phased_halfplane_front_end_time, 87.0);
-        this->get_parameter_or<double>("mapping.phased_halfplane_back_resume_start_time", phased_halfplane_back_resume_start_time, 88.0);
-        this->get_parameter_or<double>("mapping.phased_halfplane_back_resume_end_time", phased_halfplane_back_resume_end_time, 1.0e9);
-        this->get_parameter_or<string>("mapping.phased_halfplane_phase1_target", phased_halfplane_phase1_target, "back");
-        this->get_parameter_or<string>("mapping.phased_halfplane_phase2_target", phased_halfplane_phase2_target, "front");
-        this->get_parameter_or<string>("mapping.phased_halfplane_phase3_target", phased_halfplane_phase3_target, "back");
-        vector<double> phased_halfplane_segments_start_times;
-        vector<double> phased_halfplane_segments_end_times;
-        vector<string> phased_halfplane_segments_targets;
-        this->get_parameter_or<vector<double>>("mapping.phased_halfplane_segments_start_times", phased_halfplane_segments_start_times, vector<double>());
-        this->get_parameter_or<vector<double>>("mapping.phased_halfplane_segments_end_times", phased_halfplane_segments_end_times, vector<double>());
-        this->get_parameter_or<vector<string>>("mapping.phased_halfplane_segments_targets", phased_halfplane_segments_targets, vector<string>());
-        this->get_parameter_or<double>("mapping.voxel_size_normal", voxel_size_normal, -1.0);
-        this->get_parameter_or<bool>("mapping.voxel_size_fine_enable", voxel_size_fine_enable, true);
-        this->get_parameter_or<double>("mapping.voxel_size_fine", voxel_size_fine, -1.0);
-        this->get_parameter_or<double>("mapping.voxel_ramp_duration", voxel_ramp_duration, 0.0);
         this->get_parameter_or<bool>("mapping.windowed_voxel_enable", windowed_voxel_enable, false);
         this->get_parameter_or<double>("mapping.windowed_voxel_start_time", windowed_voxel_start_time, 290.0);
         this->get_parameter_or<double>("mapping.windowed_voxel_end_time", windowed_voxel_end_time, 296.0);
@@ -2130,6 +1997,11 @@ public:
             imu_only_enable = false;
         }
         this->get_parameter_or<bool>("mapping.imu_trust_window_enable", imu_trust_window_enable, false);
+        this->get_parameter_or<bool>("mapping.imu_trust_window_use_ros_time", imu_trust_window_use_ros_time, false);
+        this->get_parameter_or<double>("mapping.imu_trust_window_time_origin", imu_trust_window_time_origin, 0.0);
+        if (imu_trust_window_enable && imu_trust_window_use_ros_time &&
+            (!this->get_parameter("use_sim_time").as_bool() || imu_trust_window_time_origin <= 0.0))
+            throw std::runtime_error("ROS-time trust window requires use_sim_time=true and a positive bag time origin");
         this->get_parameter_or<double>("mapping.imu_trust_window_start_time", imu_trust_window_start_time, 0.0);
         this->get_parameter_or<double>("mapping.imu_trust_window_end_time", imu_trust_window_end_time, 1.0e9);
         this->get_parameter_or<double>("mapping.imu_trust_window_value", imu_trust_window_value, 1.0);
@@ -2163,33 +2035,6 @@ public:
         this->get_parameter_or<vector<double>>("mapping.extrinsic_T", extrinT, vector<double>());
         this->get_parameter_or<vector<double>>("mapping.extrinsic_R", extrinR, vector<double>());
 
-        rebuild_legacy_fine_voxel_segments();
-        if (!phased_halfplane_segments_start_times.empty() ||
-            !phased_halfplane_segments_end_times.empty() ||
-            !phased_halfplane_segments_targets.empty())
-        {
-            if (phased_halfplane_segments_start_times.size() == phased_halfplane_segments_end_times.size() &&
-                phased_halfplane_segments_start_times.size() == phased_halfplane_segments_targets.size())
-            {
-                phased_halfplane_segments.clear();
-                for (size_t idx = 0; idx < phased_halfplane_segments_targets.size(); idx++)
-                {
-                    phased_halfplane_segments.push_back(
-                        {phased_halfplane_segments_start_times[idx],
-                         phased_halfplane_segments_end_times[idx],
-                         phased_halfplane_segments_targets[idx]});
-                }
-            }
-            else
-            {
-                RCLCPP_WARN(this->get_logger(),
-                            "Ignoring phased_halfplane_segments_* because list lengths differ: starts=%zu ends=%zu targets=%zu",
-                            phased_halfplane_segments_start_times.size(),
-                            phased_halfplane_segments_end_times.size(),
-                            phased_halfplane_segments_targets.size());
-            }
-        }
-
         RCLCPP_INFO(this->get_logger(), "p_pre->lidar_type %d", p_pre->lidar_type);
 
         path.header.stamp = this->get_clock()->now();
@@ -2221,6 +2066,65 @@ public:
         p_imu->set_acc_bias_cov(V3D(b_acc_cov, b_acc_cov, b_acc_cov));
         p_imu->imu_trust_scale = imu_trust_scale;
         p_imu->deskew_enable = deskew_enable;
+        p_imu->gap_covariance_enable = this->declare_parameter<bool>("mapping.gap_covariance_enable", false);
+        p_imu->gap_skip_empty = this->declare_parameter<bool>("mapping.gap_skip_empty", false);
+        p_imu->gap_min_seconds = this->declare_parameter<double>("mapping.gap_min_seconds", 0.1);
+        auto gap_g = this->declare_parameter<std::vector<double>>("mapping.gap_q_alpha", std::vector<double>{0.,0.,0.});
+        auto gap_a = this->declare_parameter<std::vector<double>>("mapping.gap_q_accel_world", std::vector<double>{0.,0.,0.});
+        if (gap_g.size()!=3 || gap_a.size()!=3 || !std::isfinite(p_imu->gap_min_seconds) || p_imu->gap_min_seconds<=0.)
+            throw std::invalid_argument("Invalid gap covariance parameters");
+        for(int axis=0;axis<3;++axis) {
+            p_imu->gap_q_alpha(axis,axis)=gap_g[axis];
+            p_imu->gap_q_accel_world(axis,axis)=gap_a[axis];
+        }
+        gap_covariance::checkDensity(p_imu->gap_q_alpha);
+        gap_covariance::checkDensity(p_imu->gap_q_accel_world);
+        const bool gap_adaptive_enable = this->declare_parameter<bool>("mapping.gap_adaptive_enable", false);
+        const double gap_forgetting = this->declare_parameter<double>("mapping.gap_adaptive_forgetting", 0.95);
+        const std::string gap_adaptive_csv = this->declare_parameter<std::string>("mapping.gap_adaptive_csv", "/tmp/fastlio_gap_adaptive.csv");
+        if (gap_adaptive_enable && (!p_imu->gap_covariance_enable || !p_imu->gap_skip_empty))
+            throw std::invalid_argument("Adaptive gap requires covariance and skip-empty enabled");
+        p_imu->gap_adaptive.configure(gap_adaptive_enable, gap_forgetting, gap_adaptive_csv);
+        p_imu->gap_block_mode=this->declare_parameter<std::string>("mapping.gap_block_mode","full");
+        gap_covariance::selectBlocks(gap_covariance::Mat9::Zero(),p_imu->gap_block_mode);
+        if(gap_adaptive_enable && p_imu->gap_block_mode!="full")throw std::invalid_argument("LiDAR-feedback learning supports full blocks only");
+        bool consistency_on=this->declare_parameter<bool>("mapping.gap_consistency_enable",false);
+        auto consistency_prefix=this->declare_parameter<std::string>("mapping.gap_consistency_prefix","/tmp/gap_consistency");
+        g_gap_consistency.configure(consistency_on,consistency_prefix);
+        if(consistency_on){
+            p_imu->gap_applied_log.open(consistency_prefix+"_applied.csv");
+            if(!p_imu->gap_applied_log)throw std::runtime_error("Cannot open applied gap log");
+            p_imu->gap_applied_log<<"head,tail,h,blocks,qgx,qgy,qgz,qax,qay,qaz,theta_trace,velocity_trace,position_trace\n";
+        }
+
+        auto& learner=p_imu->gap_imu_only;
+        learner.enabled=this->declare_parameter<bool>("mapping.gap_imu_only_enable",false);
+        learner.max_dt=this->declare_parameter<double>("mapping.gap_imu_only_max_dt",.0125);
+        learner.min_h=this->declare_parameter<double>("mapping.gap_imu_only_min_h",.02);
+        learner.max_h=this->declare_parameter<double>("mapping.gap_imu_only_max_h",1.);
+        learner.margin=this->declare_parameter<double>("mapping.gap_imu_only_margin",.02);
+        learner.cadence=this->declare_parameter<double>("mapping.gap_imu_only_cadence",.1);
+        learner.tau=this->declare_parameter<double>("mapping.gap_imu_only_tau",5.);
+        learner.warmup_h=this->declare_parameter<std::vector<double>>("mapping.gap_imu_only_warmup_h",std::vector<double>{.05,.1,.2,.3});
+        const auto learner_csv=this->declare_parameter<std::string>("mapping.gap_imu_only_csv","/tmp/fastlio_gap_imu_only.csv");
+        learner.adaptive_input=this->declare_parameter<bool>("mapping.gap_imu_only_adaptive_input",false);
+        learner.input_windows=this->declare_parameter<std::vector<double>>("mapping.gap_input_windows",std::vector<double>{.25,.5,1.,2.,4.,8.});
+        p_imu->gap_input_min_dt=this->declare_parameter<double>("mapping.gap_input_min_dt",.0125);
+        if(learner.adaptive_input && !learner.enabled)throw std::invalid_argument("Adaptive gap input requires IMU-only learning");
+        if(!(p_imu->gap_input_min_dt>0))throw std::invalid_argument("Invalid gap_input_min_dt");
+        p_imu->gap_cv_fixed=this->declare_parameter<bool>("mapping.gap_cv_fixed_enable",false);
+        if(p_imu->gap_cv_fixed && (learner.enabled || !p_imu->gap_covariance_enable || !p_imu->gap_skip_empty))
+            throw std::invalid_argument("Fixed constant-velocity gap rule requires fixed gap covariance, skip-empty, learning OFF");
+        if(learner.enabled){
+            if(gap_adaptive_enable || !p_imu->gap_covariance_enable || !p_imu->gap_skip_empty)
+                throw std::invalid_argument("IMU-only learning requires gap covariance, skip-empty and LiDAR correction learning OFF");
+            learner.open(learner_csv);
+            // No imported 05a prior. Before first valid window, additional density is zero.
+            p_imu->gap_q_alpha.setZero();p_imu->gap_q_accel_world.setZero();
+        }
+
+
+
 
         fill(epsi, epsi+23, 0.001);
         kf.init_dyn_share(get_f, df_dx, df_dw, h_share_model, NUM_MAX_ITERATIONS, epsi);
@@ -2257,11 +2161,18 @@ public:
         }
 
         /*** ROS subscribe initialization ***/
-        sensor_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::Reentrant);
+        // One mutually exclusive group per sensor keeps each topic's callbacks in arrival order.
+        // A reentrant group let two messages of the same topic run concurrently on the
+        // multi-threaded executor; a later stamp could land first and the earlier one then
+        // tripped the "loop back" check, clearing the whole LiDAR/IMU buffer.
+        sensor_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
+        imu_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
         processing_callback_group_ = this->create_callback_group(rclcpp::CallbackGroupType::MutuallyExclusive);
 
         rclcpp::SubscriptionOptions sensor_sub_options;
         sensor_sub_options.callback_group = sensor_callback_group_;
+        rclcpp::SubscriptionOptions imu_sub_options;
+        imu_sub_options.callback_group = imu_callback_group_;
 
         if (p_pre->lidar_type == AVIA)
         {
@@ -2290,9 +2201,10 @@ public:
         }
         else
         {
-            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::SensorDataQoS(), standard_pcl_cbk, sensor_sub_options);
+            // Reliable with a deep queue: best-effort depth 5 silently dropped scans under load.
+            sub_pcl_pc_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(lid_topic, rclcpp::QoS(rclcpp::KeepLast(200)).reliable(), standard_pcl_cbk, sensor_sub_options);
         }
-        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, 10, imu_cbk, sensor_sub_options);
+        sub_imu_ = this->create_subscription<sensor_msgs::msg::Imu>(imu_topic, rclcpp::QoS(rclcpp::KeepLast(2000)).reliable(), imu_cbk, imu_sub_options);
         pubLaserCloudFull_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered", 20);
         pubLaserCloudFull_body_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_registered_body", 20);
         pubLaserCloudEffect_ = this->create_publisher<sensor_msgs::msg::PointCloud2>("/cloud_effected", 20);
@@ -2345,6 +2257,94 @@ public:
     }
 
 private:
+    // Estimate IMU cadence over a timestamp window rather than from one interval.
+    // This resists occasional fast/slow samples and remains independent of bag
+    // playback rate because it uses sensor timestamps, not ROS wall time.
+    void update_imu_rate_adaptive_mode(const MeasureGroup &measures)
+    {
+        if (!imu_rate_adaptive_enable)
+            return;
+
+        for (const auto &imu : measures.imu)
+        {
+            const double timestamp = get_time_sec(imu->header.stamp);
+            if (!std::isfinite(imu_rate_last_timestamp_))
+            {
+                imu_rate_last_timestamp_ = timestamp;
+                imu_rate_timestamps_.push_back(timestamp);
+                continue;
+            }
+
+            const double dt = timestamp - imu_rate_last_timestamp_;
+            if (dt <= 0.0)
+            {
+                // A bag loop/reset starts a fresh qualification period in the
+                // safe baseline mode; duplicate boundary samples are ignored.
+                if (dt < 0.0)
+                {
+                    imu_rate_low_mode_ = false;
+                    imu_rate_candidate_start_timestamp_ = std::numeric_limits<double>::quiet_NaN();
+                    imu_rate_timestamps_.clear();
+                    imu_rate_timestamps_.push_back(timestamp);
+                }
+                imu_rate_last_timestamp_ = timestamp;
+                continue;
+            }
+
+            imu_rate_timestamps_.push_back(timestamp);
+            // Keep one sample immediately before the window boundary.  It
+            // provides a span of at least one full observation window for
+            // (N-1)/dt; dropping it would leave a span just under one second
+            // after nearly every update and prevent classification entirely.
+            while (imu_rate_timestamps_.size() > 1 &&
+                   imu_rate_timestamps_[1] <= timestamp - imu_rate_observation_window_sec)
+            {
+                imu_rate_timestamps_.pop_front();
+            }
+            imu_rate_last_timestamp_ = timestamp;
+
+            const double observed_span = timestamp - imu_rate_timestamps_.front();
+            // Do not classify until a full observation window is available.
+            if (observed_span < imu_rate_observation_window_sec - 1e-6)
+                continue;
+
+            const double observed_hz = static_cast<double>(imu_rate_timestamps_.size() - 1) / observed_span;
+            // Tolerance prevents floating-point subtraction from classifying an
+            // exact 100 Hz stream as slightly above the threshold.
+            const bool wants_low_mode = observed_hz <= imu_rate_low_hz_threshold + 1e-3;
+            if (wants_low_mode == imu_rate_low_mode_)
+            {
+                imu_rate_candidate_start_timestamp_ = std::numeric_limits<double>::quiet_NaN();
+            }
+            else
+            {
+                if (!std::isfinite(imu_rate_candidate_start_timestamp_))
+                    imu_rate_candidate_start_timestamp_ = imu_rate_last_timestamp_;
+
+                const double required_hold = wants_low_mode ? imu_rate_low_hold_sec
+                                                            : imu_rate_recovery_hold_sec;
+                if (timestamp - imu_rate_candidate_start_timestamp_ >= required_hold)
+                {
+                    imu_rate_low_mode_ = wants_low_mode;
+                    imu_rate_candidate_start_timestamp_ = std::numeric_limits<double>::quiet_NaN();
+                    if (imu_rate_low_mode_)
+                    {
+                        RCLCPP_WARN(this->get_logger(),
+                                    "IMU rolling-average rate stayed at or below %.1f Hz for %.1f s; enabling low-rate mode (deskew off, IMU trust scale %.2f)",
+                                    imu_rate_low_hz_threshold, imu_rate_low_hold_sec,
+                                    imu_rate_low_imu_trust_scale);
+                    }
+                    else
+                    {
+                        RCLCPP_INFO(this->get_logger(),
+                                    "IMU rolling-average rate stayed above %.1f Hz for %.1f s; restoring baseline mode (deskew on/configured)",
+                                    imu_rate_low_hz_threshold, imu_rate_recovery_hold_sec);
+                    }
+                }
+            }
+        }
+    }
+
     void flush_scan_pcd()
     {
         if (!pcd_save_en || pcd_save_interval <= 0 || pcl_wait_save->empty())
@@ -2390,6 +2390,27 @@ private:
     {
         if(sync_packages(Measures))
         {
+            if (p_imu->gap_skip_empty && Measures.imu.empty()) {
+                // sync_packages already popped all queues for this LiDAR scan.
+                // Keep future IMU and the prior propagation state/time intact.
+                if (feats_undistort) feats_undistort->clear();
+                RCLCPP_WARN(this->get_logger(), "GAP_SKIP_EMPTY scan_begin=%.9f scan_end=%.9f",
+                            Measures.lidar_beg_time, Measures.lidar_end_time);
+                return;
+            }
+
+            if (imu_propagation_experiment_) {
+                std::vector<ImuPropagationExperiment::ImuData> samples;
+                samples.reserve(Measures.imu.size());
+                for (const auto &imu : Measures.imu) {
+                    const auto &a=imu->linear_acceleration, &w=imu->angular_velocity;
+                    samples.push_back({get_time_sec(imu->header.stamp), {a.x,a.y,a.z}, {w.x,w.y,w.z}});
+                }
+                imu_propagation_experiment_->append(samples);
+                imu_propagation_experiment_->evaluateScan(kf.get_x(), experiment_state_timestamp_,
+                    Measures.lidar_beg_time, Measures.lidar_end_time, p_imu->acceleration_scale(),
+                    p_imu->initialized());
+            }
             if (flg_first_scan)
             {
                 first_lidar_time = Measures.lidar_beg_time;
@@ -2407,12 +2428,57 @@ private:
             svd_time   = 0;
             t0 = omp_get_wtime();
 
-            if (imu_trust_window_enable)
-            {
-                const double pre_scan_relative_time = Measures.lidar_beg_time - first_lidar_time;
-                p_imu->imu_trust_scale = use_imu_trust_window(pre_scan_relative_time) ? imu_trust_window_value : imu_trust_scale;
+            const double pre_scan_relative_time = Measures.lidar_beg_time - first_lidar_time;
+            // A delayed sensor header must not postpone a replay-delivery-time intervention.
+            // Default remains the existing scan-header-relative window.
+            const double trust_window_time = imu_trust_window_use_ros_time
+                ? this->now().seconds() - imu_trust_window_time_origin
+                : pre_scan_relative_time;
+            const double configured_imu_trust_scale = imu_trust_window_enable &&
+                                                      use_imu_trust_window(trust_window_time)
+                                                          ? imu_trust_window_value
+                                                          : imu_trust_scale;
+            update_imu_rate_adaptive_mode(Measures);
+            p_imu->deskew_enable = imu_rate_adaptive_enable && imu_rate_low_mode_
+                                      ? false
+                                      : deskew_enable;
+            p_imu->imu_trust_scale = imu_rate_adaptive_enable && imu_rate_low_mode_
+                                        ? imu_rate_low_imu_trust_scale
+                                        : configured_imu_trust_scale;
+            if (imu_trust_window_enable && imu_trust_window_use_ros_time) {
+                static double previous_logged_scale = -1.0;
+                if (previous_logged_scale != p_imu->imu_trust_scale) {
+                    RCLCPP_INFO(this->get_logger(),
+                        "TRUST_WINDOW replay=%.6f scan_end=%.6f imu_count=%zu scale=%.1f deskew=%d",
+                        trust_window_time, Measures.lidar_end_time - imu_trust_window_time_origin,
+                        Measures.imu.size(), p_imu->imu_trust_scale, p_imu->deskew_enable);
+                    previous_logged_scale = p_imu->imu_trust_scale;
+                }
             }
+            const bool experiment_was_initialized = imu_propagation_experiment_ && p_imu->initialized();
             p_imu->Process(Measures, kf, feats_undistort);
+            // Learn only AFTER this scan's propagation. New densities affect future
+            // scans; no retroactive use of the end-of-window IMU in this scan's P.
+            if(p_imu->gap_imu_only.enabled && p_imu->initialized()) {
+                for(const auto& m:Measures.imu) {
+                    ImuOnlyGapLearning::Sample sample;
+                    sample.t=rclcpp::Time(m->header.stamp).seconds();
+                    sample.w=Eigen::Vector3d(m->angular_velocity.x,m->angular_velocity.y,m->angular_velocity.z);
+                    sample.a=p_imu->acceleration_scale()*Eigen::Vector3d(m->linear_acceleration.x,m->linear_acceleration.y,m->linear_acceleration.z);
+                    p_imu->gap_imu_only.push(sample);
+                }
+                for(const auto& event:p_imu->gap_imu_only_pending)
+                    p_imu->gap_imu_only.observeGap(event.first,event.second);
+                p_imu->gap_imu_only_pending.clear();
+                if(p_imu->gap_imu_only.ready()) {
+                    p_imu->gap_q_alpha=Eigen::Matrix3d::Identity()*p_imu->gap_imu_only.q_alpha;
+                    p_imu->gap_q_accel_world=Eigen::Matrix3d::Identity()*p_imu->gap_imu_only.q_accel;
+                    p_imu->gap_input_adaptive=p_imu->gap_imu_only.adaptive_input;
+                }
+            }
+
+            if (experiment_was_initialized && !Measures.imu.empty())
+                experiment_state_timestamp_ = Measures.lidar_end_time;
             state_point = kf.get_x();
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
 
@@ -2432,98 +2498,17 @@ private:
             const double active_surf_leaf_size = use_windowed_voxel_window(scan_relative_time)
                                                       ? windowed_voxel_leaf_size
                                                       : filter_size_surf_min;
-            // front/back-target segments keep the pre-existing hard-step half-plane split
-            // (only the targeted half-plane's leaf size moves; the other half stays at
-            // active_surf_leaf_size, so this can't reuse the single-value "total" ramp
-            // below). voxel_size_fine_enable also ramps the targeted half-plane's leaf
-            // size in/out over voxel_ramp_duration around [start_time, end_time]; with
-            // voxel_size_fine_enable off (or ramp_duration<=0) this collapses back to the
-            // exact old hard step at the segment boundary.
-            FineVoxelSegment active_halfplane_segment;
-            bool has_active_halfplane_segment = false;
-            for (const auto &seg : phased_halfplane_segments)
+            downSizeFilterSurf.setLeafSize(active_surf_leaf_size, active_surf_leaf_size, active_surf_leaf_size);
+            downSizeFilterSurf.setInputCloud(feats_undistort);
+            downSizeFilterSurf.filter(*feats_down_body);
+            // VoxelSLAM re-downsamples at half the voxel size whenever the first
+            // pass leaves fewer than 500 points (voxelslam.cpp L1629-1633), so a
+            // sparse-feature moment still gets a floor on point density.
+            if (feats_down_body->points.size() < 500)
             {
-                if (is_total_halfplane_target(seg.target))
-                {
-                    continue;
-                }
-                const double margin = voxel_size_fine_enable ? voxel_ramp_duration : 0.0;
-                if (scan_relative_time >= seg.start_time - margin && scan_relative_time <= seg.end_time + margin)
-                {
-                    active_halfplane_segment = seg;
-                    has_active_halfplane_segment = true;
-                }
-            }
-
-            if (has_active_halfplane_segment)
-            {
-                const double halfplane_fine_target = resolve_fine_voxel_leaf_size(active_surf_leaf_size);
-                double fine_leaf_size = halfplane_fine_target;
-                double base_leaf_size = active_surf_leaf_size;
-                if (voxel_size_fine_enable)
-                {
-                    const double voxel_normal_resolved = (voxel_size_normal > 0.0) ? voxel_size_normal : active_surf_leaf_size;
-                    const double voxel_fine_resolved = (voxel_size_fine > 0.0) ? voxel_size_fine : resolve_fine_voxel_leaf_size(active_surf_leaf_size);
-                    // The untargeted half-plane inherits any adjacent/overlapping "total"
-                    // segment's ramp value (e.g. a total segment ending right where this
-                    // front/back segment begins) instead of jumping straight to
-                    // active_surf_leaf_size, so a total->half-plane handoff is one smooth
-                    // transition rather than a hard step. With no such total segment nearby
-                    // this just evaluates to voxel_normal_resolved, unchanged from before.
-                    const double total_background = compute_voxel_size(scan_relative_time, phased_halfplane_segments,
-                                                                        voxel_normal_resolved, voxel_fine_resolved, voxel_ramp_duration);
-                    const double own_ramp = compute_voxel_size(scan_relative_time,
-                                                               active_halfplane_segment.start_time, active_halfplane_segment.end_time,
-                                                               voxel_normal_resolved, halfplane_fine_target, voxel_ramp_duration);
-                    // Symmetrically, the targeted half-plane also can't un-fine below what
-                    // an overlapping total segment demands, so the transition stays
-                    // continuous at both ends of the handoff (see own_ramp vs total_background).
-                    fine_leaf_size = std::min(own_ramp, total_background);
-
-                    base_leaf_size = total_background;
-                    if (phased_halfplane_other_leaf_size > 0.0)
-                    {
-                        // The untargeted half-plane can also be given its own explicit
-                        // target (independent of voxel_size_normal), ramping toward it the
-                        // same way the targeted half-plane ramps toward halfplane_fine_target.
-                        const double own_other_ramp = compute_voxel_size(scan_relative_time,
-                                                                         active_halfplane_segment.start_time, active_halfplane_segment.end_time,
-                                                                         voxel_normal_resolved, phased_halfplane_other_leaf_size, voxel_ramp_duration);
-                        base_leaf_size = std::min(own_other_ramp, total_background);
-                    }
-                }
-                downsample_target_halfplane_with_fine_voxel(
-                    feats_undistort,
-                    feats_down_body,
-                    base_leaf_size,
-                    fine_leaf_size,
-                    is_front_halfplane_target(active_halfplane_segment.target));
-            }
-            else
-            {
-                const double voxel_normal_resolved = (voxel_size_normal > 0.0) ? voxel_size_normal : active_surf_leaf_size;
-                double voxel_size_now = voxel_normal_resolved;
-                if (voxel_size_fine_enable)
-                {
-                    const double voxel_fine_resolved = (voxel_size_fine > 0.0) ? voxel_size_fine : resolve_fine_voxel_leaf_size(active_surf_leaf_size);
-                    voxel_size_now = compute_voxel_size(scan_relative_time, phased_halfplane_segments,
-                                                        voxel_normal_resolved, voxel_fine_resolved, voxel_ramp_duration);
-                }
-                // else: "total"-target segments have no effect; voxel size stays voxel_normal_resolved
-                downSizeFilterSurf.setLeafSize(voxel_size_now, voxel_size_now, voxel_size_now);
+                downSizeFilterSurf.setLeafSize(active_surf_leaf_size / 2, active_surf_leaf_size / 2, active_surf_leaf_size / 2);
                 downSizeFilterSurf.setInputCloud(feats_undistort);
                 downSizeFilterSurf.filter(*feats_down_body);
-                // VoxelSLAM re-downsamples at half the voxel size whenever the first
-                // pass leaves fewer than 500 points (voxelslam.cpp L1629-1633), so a
-                // sparse-feature moment (doorway threshold, low-clearance corridor)
-                // still gets a floor on point density. Stock FAST-LIO2 has no such
-                // fallback -- it just keeps whatever the fixed-size grid produced.
-                if (feats_down_body->points.size() < 500)
-                {
-                    downSizeFilterSurf.setLeafSize(voxel_size_now / 2, voxel_size_now / 2, voxel_size_now / 2);
-                    downSizeFilterSurf.setInputCloud(feats_undistort);
-                    downSizeFilterSurf.filter(*feats_down_body);
-                }
             }
             t1 = omp_get_wtime();
             feats_down_size = feats_down_body->points.size();
@@ -2581,6 +2566,26 @@ private:
             double t_update_start = omp_get_wtime();
             double solve_H_time = 0;
             latest_degeneracy_result = DegeneracyResult{};
+            // Analysis-only: reset alongside latest_degeneracy_result so a scan
+            // where the LiDAR update is skipped (imu-only window) logs NaN/0
+            // instead of stale values from a previous scan.
+            g_h_share_calls_this_scan = 0;
+            g_pre_valid_count = 0;
+            g_pre_scan2map_rmse = std::numeric_limits<double>::quiet_NaN();
+            g_pre_mean_abs_residual = std::numeric_limits<double>::quiet_NaN();
+            g_post_valid_count = 0;
+            g_post_scan2map_rmse = std::numeric_limits<double>::quiet_NaN();
+            g_post_mean_abs_residual = std::numeric_limits<double>::quiet_NaN();
+#ifdef FASTLIO_ABLATION_REPLAY
+            g_ablation_predicted_state = kf.get_x();
+            g_ablation_pre_position_cov = kf.get_P().block<3,3>(0,0).trace();
+            g_ablation_pre_rotation_cov = kf.get_P().block<3,3>(3,3).trace();
+            g_ablation_pre_velocity_cov = kf.get_P().block<3,3>(12,12).trace();
+#endif
+            const state_ikfom gap_predicted_state = kf.get_x();
+            g_gap_first_evaluation_logged=false;
+            if(g_gap_consistency.enabled)g_gap_consistency.begin(Measures.lidar_end_time,gap_predicted_state,kf.get_P());
+
             if (!in_imu_only_window(scan_relative_time))
             {
                 kf.update_iterated_dyn_share_modified(LASER_POINT_COV, solve_H_time);
@@ -2588,6 +2593,43 @@ private:
             // else: skip the LiDAR measurement update entirely for this scan -- the
             // state stays exactly at the IMU-only forward-propagated value already in kf.
             state_point = kf.get_x();
+            // Diagnostic only (env FASTLIO_STATE_LOG): prior/post velocity and biases per scan.
+            if (const char *state_log_path = std::getenv("FASTLIO_STATE_LOG")) {
+                static std::ofstream state_log;
+                if (!state_log.is_open()) {
+                    state_log.open(state_log_path);
+                    state_log << "t,imu_count,prior_vx,prior_vy,prior_vz,vx,vy,vz,bgx,bgy,bgz,bax,bay,baz,Pvv,Pba,Pbg\n";
+                }
+                const auto P = kf.get_P();
+                state_log << std::setprecision(17) << Measures.lidar_end_time << ',' << Measures.imu.size();
+                for (int i = 0; i < 3; ++i) state_log << ',' << gap_predicted_state.vel(i);
+                for (int i = 0; i < 3; ++i) state_log << ',' << state_point.vel(i);
+                for (int i = 0; i < 3; ++i) state_log << ',' << state_point.bg(i);
+                for (int i = 0; i < 3; ++i) state_log << ',' << state_point.ba(i);
+                state_log << ',' << P.block<3,3>(12,12).trace() << ',' << P.block<3,3>(18,18).trace() << ',' << P.block<3,3>(15,15).trace() << '\n';
+                state_log.flush();
+            }
+            if(g_gap_consistency.enabled){
+                if(!g_gap_first_evaluation_logged)g_gap_consistency.unavailable();
+                g_gap_consistency.writePose("post",state_point,kf.get_P());
+            }
+            // Analysis-only: POST RMSE at the true final state, only if the LiDAR
+            // update actually ran this scan (g_h_share_calls_this_scan > 0).
+            if (g_h_share_calls_this_scan > 0)
+            {
+                compute_post_scan2map_rmse(state_point, g_post_scan2map_rmse,
+                                            g_post_mean_abs_residual, g_post_valid_count);
+            }
+            if (p_imu->gap_adaptive.enabled && p_imu->gap_adaptive.gaps>0) {
+                Eigen::Matrix<double,23,1> correction;
+                state_point.boxminus(correction, gap_predicted_state);
+                const bool feedback_valid = g_h_share_calls_this_scan>0 && g_pre_valid_count>=6 &&
+                    g_post_valid_count>=6 && std::isfinite(g_post_scan2map_rmse) &&
+                    !latest_degeneracy_result.is_degenerate_voxelslam;
+                p_imu->gap_adaptive.finish(Measures.lidar_end_time, correction, feedback_valid,
+                                          p_imu->gap_q_alpha, p_imu->gap_q_accel_world);
+            }
+            g_frame_id_counter++;
             euler_cur = SO3ToEuler(state_point.rot);
             pos_lid = state_point.pos + state_point.rot * state_point.offset_T_L_I;
             geoQuat.x = state_point.rot.coeffs()[0];
@@ -2608,17 +2650,46 @@ private:
                     std::string path = (dir ? std::string(dir) : std::string("/tmp")) + "/fastlio2_degeneracy.csv";
                     degeneracy_ofs.open(path);
                     if (degeneracy_ofs.is_open())
-                        degeneracy_ofs << "t,valid_plane_num,lambda_min,lambda_min_norm,is_degenerate_voxelslam,persistent_degenerate,early_warning\n";
+                        degeneracy_ofs << "t,valid_plane_num,lambda_min,lambda_min_norm,is_degenerate_voxelslam,persistent_degenerate,early_warning,pos_cov_trace,rot_cov_trace,"
+                                          "frame_id,valid_constraint_count,pre_scan2map_rmse,post_scan2map_rmse,pre_mean_abs_residual,post_mean_abs_residual,degeneracy_flag\n";
                 }
                 if (degeneracy_ofs.is_open())
                 {
+                    // Position/orientation uncertainty from the current ESIKF
+                    // state covariance, logged alongside the geometric
+                    // degeneracy metrics so a degenerate window's actual
+                    // effect on filter confidence can be compared across
+                    // configs without relying on trajectory divergence.
+                    auto P_cur = kf.get_P();
+                    double pos_cov_trace = P_cur.block<3, 3>(0, 0).trace();
+                    double rot_cov_trace = P_cur.block<3, 3>(3, 3).trace();
+
+                    // Analysis-only: literal "normalized_min_eigenvalue <= 0.12 for
+                    // 4 consecutive frames" rule requested for this experiment.
+                    // Independent of persistent_degenerate above (7-of-10 window).
+                    if (std::isfinite(latest_degeneracy_result.lambda_min_norm) &&
+                        latest_degeneracy_result.lambda_min_norm <= degeneracy_direction_threshold)
+                        g_consecutive_lambda_degenerate++;
+                    else
+                        g_consecutive_lambda_degenerate = 0;
+                    const bool degeneracy_flag_4frame = g_consecutive_lambda_degenerate >= 4;
+
                     degeneracy_ofs << std::fixed << std::setprecision(6) << Measures.lidar_beg_time << ","
                                    << latest_degeneracy_result.valid_plane_num << ","
                                    << std::setprecision(6) << latest_degeneracy_result.lambda_min << ","
                                    << latest_degeneracy_result.lambda_min_norm << ","
                                    << (latest_degeneracy_result.is_degenerate_voxelslam ? 1 : 0) << ","
                                    << (latest_degeneracy_result.persistent_degenerate ? 1 : 0) << ","
-                                   << (latest_degeneracy_result.early_warning ? 1 : 0) << "\n";
+                                   << (latest_degeneracy_result.early_warning ? 1 : 0) << ","
+                                   << std::setprecision(9) << pos_cov_trace << ","
+                                   << rot_cov_trace << ","
+                                   << g_frame_id_counter << ","
+                                   << g_pre_valid_count << ","
+                                   << g_pre_scan2map_rmse << ","
+                                   << g_post_scan2map_rmse << ","
+                                   << g_pre_mean_abs_residual << ","
+                                   << g_post_mean_abs_residual << ","
+                                   << (degeneracy_flag_4frame ? 1 : 0) << "\n";
                     degeneracy_ofs.flush();
                 }
             }
@@ -2957,6 +3028,8 @@ private:
     }
 
 private:
+    std::unique_ptr<ImuPropagationExperiment> imu_propagation_experiment_;
+    double experiment_state_timestamp_ = std::numeric_limits<double>::quiet_NaN();
     static double local_ba_rmse(const deque<LocalBAFrame> &frames,
                                 const vector<Eigen::Quaterniond> &quaternions,
                                 const vector<Eigen::Vector3d> &translations)
@@ -3732,6 +3805,7 @@ private:
     rclcpp::Subscription<livox_ros_driver2::msg::CustomMsg>::SharedPtr sub_pcl_livox_;
     rclcpp::GenericSubscription::SharedPtr sub_pcl_livox_legacy_;
     rclcpp::CallbackGroup::SharedPtr sensor_callback_group_;
+    rclcpp::CallbackGroup::SharedPtr imu_callback_group_;
     rclcpp::CallbackGroup::SharedPtr processing_callback_group_;
 
     std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
@@ -3764,6 +3838,10 @@ private:
     nav_msgs::msg::Path local_ba_path_;
     int local_ba_next_frame_id_ = 0;
     bool local_ba_previous_map_pose_used_ba_ = false;
+    bool imu_rate_low_mode_ = false;
+    double imu_rate_last_timestamp_ = std::numeric_limits<double>::quiet_NaN();
+    double imu_rate_candidate_start_timestamp_ = std::numeric_limits<double>::quiet_NaN();
+    deque<double> imu_rate_timestamps_;
 };
 
 inline bool parse_cpu_list(const std::string &text, std::vector<int> &cpus)

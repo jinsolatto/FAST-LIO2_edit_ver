@@ -123,6 +123,22 @@ endif()
 
 ament_target_dependencies(fastlio_mapping ${dependencies})
 
+option(FASTLIO_IMU_EXPERIMENT_TESTS "Build deterministic IMU experiment validation tools" OFF)
+if(FASTLIO_IMU_EXPERIMENT_TESTS)
+  find_package(rosbag2_cpp REQUIRED)
+  find_package(rosgraph_msgs REQUIRED)
+  enable_testing()
+  add_executable(test_imu_propagation_experiment tests/test_imu_propagation_experiment.cpp)
+  target_include_directories(test_imu_propagation_experiment PRIVATE include ${PCL_INCLUDE_DIRS})
+  target_link_libraries(test_imu_propagation_experiment Eigen3::Eigen ${PCL_LIBRARIES})
+  ament_target_dependencies(test_imu_propagation_experiment ${dependencies})
+  add_test(NAME imu_propagation_experiment COMMAND test_imu_propagation_experiment)
+  add_executable(replay_imu_experiment tests/replay_imu_experiment.cpp include/ikd-Tree/ikd_Tree.cpp src/preprocess.cpp)
+  target_include_directories(replay_imu_experiment PRIVATE include ${PCL_INCLUDE_DIRS} ${PYTHON_INCLUDE_DIRS})
+  target_link_libraries(replay_imu_experiment ${PCL_LIBRARIES} ${PYTHON_LIBRARIES} Eigen3::Eigen Ceres::ceres ${cpp_typesupport_target})
+  ament_target_dependencies(replay_imu_experiment ${dependencies} rosbag2_cpp rosgraph_msgs)
+endif()
+
 # ---------------- Install --------------- #
 install(TARGETS fastlio_mapping
   DESTINATION lib/${PROJECT_NAME}
