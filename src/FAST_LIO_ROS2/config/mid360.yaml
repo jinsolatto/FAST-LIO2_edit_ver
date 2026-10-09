@@ -5,7 +5,7 @@
         max_iteration: 3
         filter_size_surf: 0.2 #0.5
         filter_size_map: 0.5
-        cube_side_length: 1000.0
+        cube_side_length: 960.0
         runtime_pos_log_enable: false
         map_file_path: "/home/jschoi/edit_fastlio2/260910/final_map.pcd"
 
@@ -42,7 +42,7 @@
             pose_trajectory_log_enable: true
             pose_trajectory_log_path: "/tmp/turtleisland_10degree_course1_mid360_pose.txt"
             tum_trajectory_log_enable: true
-            tum_trajectory_log_path: "/home/jschoi/edit_fastlio2/seoul_260914/10degree/10_d_re_minimize/voxel0.2/trajectory.tum"
+            tum_trajectory_log_path: "/home/jschoi/edit_fastlio2/siheung_260914/0degree/covariance/mid360.yaml/trajectory.tum"
 
         publish:
             path_en: true                # true: publish Path

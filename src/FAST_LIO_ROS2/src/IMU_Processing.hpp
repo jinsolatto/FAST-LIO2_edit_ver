@@ -70,9 +70,29 @@ class ImuProcess
   // per channel the candidate input (endpoint or window mean) with the smallest
   // learned dynamics error + per-sample noise / actual sample count.
   bool gap_input_adaptive = false;
+  // LiDAR constant-velocity deskew fallback: when the IMU samples inside a scan leave a gap
+  // longer than deskew_cv_max_imu_gap, deskew with the body angular/linear velocity of the
+  // last two LiDAR-corrected states instead of the IMU poses (sparse or mistimed IMU).
+  bool deskew_lidar_cv_fallback = false;
+  double deskew_cv_max_imu_gap = 0.025;
+  bool lidar_cv_valid = false;
+  V3D lidar_cv_w = Zero3d, lidar_cv_v = Zero3d;   // body frame, at the last scan end
+  size_t deskew_cv_scans = 0;
+  bool last_scan_used_cv = false;
+  // false: legacy deskew anchor (retained state labelled at scan start, offset 0).
+  bool deskew_anchor_at_state_time = true;
+  // Gyro change test (adaptive mode): a window-mean gyro is kept only when it agrees with
+  // the endpoint average within IMU noise (chi-square, 3 dof); otherwise the angular rate
+  // is changing (window mean lags) and the endpoint average is used.
+  bool gap_gyro_change_test = false;
+  double gap_gyro_change_chi2 = 11.345;  // chi2(3) 99 %
+  size_t gyro_change_rejects = 0;
   // Fixed-rule baseline: for the same intervals, replace the acceleration input by the
   // value giving zero world acceleration (constant velocity); gyro stays endpoint.
   bool gap_cv_fixed = false;
+  // > 0: in the fixed rule, gyro = mean of received samples in [head - W, head] plus the tail
+  // sample (no learning). 0: endpoint average (the original fixed rule).
+  double gap_cv_gyro_window = 0.0;
   double gap_input_min_dt = 0.0125;
   Eigen::Matrix3d gap_q_alpha = Eigen::Matrix3d::Zero();
   Eigen::Matrix3d gap_q_accel_world = Eigen::Matrix3d::Zero();
@@ -120,7 +140,9 @@ class ImuProcess
   // Replaces w/a (raw units) for an interval of length h ending at `tail` (nullptr:
   // scan-end extrapolation). Returns effective densities for gap covariance.
   void chooseGapInput(double head_t, const sensor_msgs::msg::Imu::ConstSharedPtr &tail, double h,
-                      V3D &w, V3D &a, double &q_alpha, double &q_accel, std::string &tag) const;
+                      V3D &w, V3D &a, double &q_alpha, double &q_accel, std::string &tag);
+  // true = angular rate is changing relative to the window mean (use the endpoint average).
+  bool gyroChanging(const V3D &endpoint_w, const V3D &window_w, int n_window) const;
 };
 
 void ImuProcess::pushInputHistory(const sensor_msgs::msg::Imu::ConstSharedPtr &m)
@@ -129,11 +151,11 @@ void ImuProcess::pushInputHistory(const sensor_msgs::msg::Imu::ConstSharedPtr &m
   if (!input_hist_.empty() && t <= input_hist_.back().t) return;
   input_hist_.push_back({t, V3D(m->angular_velocity.x, m->angular_velocity.y, m->angular_velocity.z),
                          V3D(m->linear_acceleration.x, m->linear_acceleration.y, m->linear_acceleration.z)});
-  while (!input_hist_.empty() && t - input_hist_.front().t > gap_imu_only.maxWindow() + 1.0) input_hist_.pop_front();
+  while (!input_hist_.empty() && t - input_hist_.front().t > std::max(gap_imu_only.maxWindow(), gap_cv_gyro_window) + 1.0) input_hist_.pop_front();
 }
 
 void ImuProcess::chooseGapInput(double head_t, const sensor_msgs::msg::Imu::ConstSharedPtr &tail, double h,
-                                V3D &w, V3D &a, double &q_alpha, double &q_accel, std::string &tag) const
+                                V3D &w, V3D &a, double &q_alpha, double &q_accel, std::string &tag)
 {
   const auto &L = gap_imu_only;
   const size_t K = L.input_windows.size() + 1;
@@ -161,13 +183,26 @@ void ImuProcess::chooseGapInput(double head_t, const sensor_msgs::msg::Imu::Cons
     if (L.qr_c[k] + ng < best_g) { best_g = L.qr_c[k] + ng; g = k; noise_g = ng; }
     if (L.qv_c[k] + na < best_a) { best_a = L.qv_c[k] + na; c = k; noise_a = na; }
   }
-  if (g) w = mw[g] / n[g];
+  bool rejected = false;
+  if (g && gap_gyro_change_test && gyroChanging(w, mw[g] / n[g], n[g])) {
+    // Case 2: rotation changing -> endpoint gyro and its own learned density.
+    g = 0; noise_g = 0.; rejected = true; ++gyro_change_rejects;
+  }
+  if (g) w = mw[g] / n[g];   // case 1: rotation steady within noise -> smoothed gyro
   if (c) a = ma[c] / n[c];   // raw units, like the endpoint average (scaled by the caller)
   q_alpha = L.qr_c[g] + noise_g;
   q_accel = L.qp_c[c] + noise_a;
   std::ostringstream os;
-  os << "g" << (g ? L.input_windows[g-1] : 0.) << "/n" << n[g] << ",a" << (c ? L.input_windows[c-1] : 0.) << "/n" << n[c];
+  os << "g" << (g ? L.input_windows[g-1] : 0.) << (rejected ? "t" : "") << "/n" << n[g] << ",a" << (c ? L.input_windows[c-1] : 0.) << "/n" << n[c];
   tag = os.str();
+}
+
+bool ImuProcess::gyroChanging(const V3D &endpoint_w, const V3D &window_w, int n_window) const
+{
+  // Per-axis noise var of the difference: endpoint average (2 samples) + window mean (N samples).
+  const double var = gap_imu_only.noise_gyr * (0.5 + 1.0 / std::max(n_window, 1));
+  if (!(var > 0.)) return true;  // noise unknown -> keep the endpoint average
+  return (endpoint_w - window_w).squaredNorm() / var > gap_gyro_change_chi2;
 }
 
 ImuProcess::ImuProcess()
@@ -328,7 +363,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   // when empty scans were skipped. Keep that timestamp in the current scan's
   // coordinates; labelling this state as offset 0 shifts the first deskew
   // segment forward in time. No extra mean/covariance propagation is done here.
-  const double state_offset = last_lidar_end_time_ - pcl_beg_time;
+  const double state_offset = deskew_anchor_at_state_time ? last_lidar_end_time_ - pcl_beg_time : 0.0;
   IMUpose.push_back(set_pose6d(state_offset, acc_s_last, angvel_last, imu_state.vel, imu_state.pos, imu_state.rot.toRotationMatrix()));
 
   /*** forward propagation at each imu point ***/
@@ -365,6 +400,13 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     } else if (gap_cv_fixed && tail_stamp - head_stamp > gap_input_min_dt) {
       acc_avr = constantVelocityAcc(kf_state.get_x());
       gap_input = "cv_fixed";
+      if (gap_cv_gyro_window > 0) {
+        V3D w = V3D(tail->angular_velocity.x, tail->angular_velocity.y, tail->angular_velocity.z); int n = 1;
+        for (const auto &r : input_hist_)
+          if (r.t <= head_stamp && r.t >= head_stamp - gap_cv_gyro_window) { w += r.w; ++n; }
+        angvel_avr = w / n;
+        gap_input = "cv_fixed_gyro_window";
+      }
     }
 
     // fout_imu << setw(10) << head->header.stamp.toSec() - first_lidar_time << " " << angvel_avr.transpose() << " " << acc_avr.transpose() << endl;
@@ -443,6 +485,13 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     in.gyro = w; in.acc = a * accel_scale_;
   } else if (gap_cv_fixed && note > 0 && dt > gap_input_min_dt) {
     in.acc = constantVelocityAcc(kf_state.get_x()) * accel_scale_;
+    if (gap_cv_gyro_window > 0) {
+      pushInputHistory(v_imu.back());
+      V3D w = V3D::Zero(); int n = 0;
+      for (const auto &r : input_hist_)
+        if (r.t <= imu_end_time && r.t >= imu_end_time - gap_cv_gyro_window) { w += r.w; ++n; }
+      if (n > 0) in.gyro = w / n;
+    }
   }
   if (gap_adaptive.enabled) {
     gap_covariance::Mat23 F;
@@ -455,6 +504,31 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   last_imu_ = meas.imu.back();
   last_lidar_end_time_ = pcl_end_time;
 
+  last_scan_used_cv = false;
+  if (deskew_enable && deskew_lidar_cv_fallback && lidar_cv_valid && !pcl_out.points.empty())
+  {
+    // Largest IMU spacing over [pcl_beg, pcl_end], counting the scan edges.
+    double prev = pcl_beg_time, max_gap = 0.;
+    for (const auto &m : v_imu) {
+      const double t = rclcpp::Time(m->header.stamp).seconds();
+      if (t <= pcl_beg_time) continue;
+      if (t > pcl_end_time) break;
+      max_gap = std::max(max_gap, t - prev); prev = t;
+    }
+    max_gap = std::max(max_gap, pcl_end_time - prev);
+    if (max_gap > deskew_cv_max_imu_gap) {
+      // q_end = Exp(w*tau) q_t + v*tau, tau = t_point - t_end <= 0 (IMU body frame), then to LiDAR.
+      for (auto &pt : pcl_out.points) {
+        const double tau = pt.curvature / 1000.0 + pcl_beg_time - pcl_end_time;
+        V3D q = imu_state.offset_R_L_I * V3D(pt.x, pt.y, pt.z) + imu_state.offset_T_L_I;
+        V3D q_end = Exp(lidar_cv_w, tau) * q + lidar_cv_v * tau;
+        V3D p = imu_state.offset_R_L_I.conjugate() * (q_end - imu_state.offset_T_L_I);
+        pt.x = p(0); pt.y = p(1); pt.z = p(2);
+      }
+      last_scan_used_cv = true; ++deskew_cv_scans;
+      return;
+    }
+  }
   if (deskew_enable)
   {
     /*** undistort each lidar point (backward propagation) ***/

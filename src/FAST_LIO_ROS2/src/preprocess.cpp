@@ -546,7 +546,7 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
   const auto stamp_field = std::find_if(msg->fields.begin(), msg->fields.end(),
       [](const sensor_msgs::msg::PointField &f) { return f.name == "timestamp"; });
   std::vector<float> measured_offsets;
-  if (stamp_field != msg->fields.end())
+  if (stamp_field != msg->fields.end() && use_point_timestamp)
   {
     const uint16_t endian_probe = 1;
     const bool host_bigendian = *reinterpret_cast<const uint8_t *>(&endian_probe) == 0;
@@ -600,11 +600,12 @@ void Preprocess::mid360_handler(const sensor_msgs::msg::PointCloud2::UniquePtr &
                                    scan_relative_time >= FRONT_REJECT_START_TIME &&
                                    scan_relative_time <= FRONT_REJECT_END_TIME;
 
-  if (stamp_field != msg->fields.end())
+  if (stamp_field != msg->fields.end() && use_point_timestamp)
   {
     given_offset_time = true;
     for (size_t i = 0; i < pl_orig.size(); ++i)
     {
+      if (point_timestamp_apply_filter_num && point_filter_num > 1 && (i % point_filter_num) != 0) continue;
       const auto &p = pl_orig[i];
       const bool front = p.x >= 0.0;
       if (front) ++front_raw_point_count; else ++back_raw_point_count;

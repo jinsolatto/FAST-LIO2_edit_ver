@@ -30,6 +30,9 @@ public:
   std::vector<double> input_windows{.25,.5,1.,2.,4.,8.};
   std::vector<double> qr_c,qp_c,qv_c; // per-candidate densities (rotation, position, velocity)
   double noise_gyr=0.,noise_acc=0.;   // per-axis per-sample variance
+  // true: noise from successive-sample differences (var(x_{k+1}-x_k)/2), which is insensitive
+  // to real motion between 5 ms samples; false: spread about the window mean (includes motion).
+  bool noise_from_differences=false;
   double maxWindow() const {return input_windows.empty()?0.:*std::max_element(input_windows.begin(),input_windows.end());}
   bool ready() const {return accepted>0;}
   void open(const std::string& path) {
@@ -130,6 +133,11 @@ private:
     const int m=end-start+1;wbar/=m;abar/=m;double vg=0,va=0;
     for(int k=start;k<=end;++k){vg+=(history[k].w-wbar).squaredNorm();va+=(history[k].a-abar).squaredNorm();}
     vg/=3.*(m-1);va/=3.*(m-1);
+    if(noise_from_differences){
+      vg=0;va=0;
+      for(int k=start;k<end;++k){vg+=(history[k+1].w-history[k].w).squaredNorm();va+=(history[k+1].a-history[k].a).squaredNorm();}
+      vg/=6.*(m-1);va/=6.*(m-1);   // per axis: E||d||^2 = 3 * 2 sigma^2
+    }
     // Rotation error depends only on gyro input; velocity/position errors are
     // evaluated per acc candidate with the reference gyro (separable).
     state_ikfom ref;ref.pos.setZero();ref.vel.setZero();ref.bg.setZero();ref.ba.setZero();

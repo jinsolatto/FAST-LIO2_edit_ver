@@ -190,6 +190,8 @@ class Preprocess
   vector<orgtype> typess[128]; //maximum 128 line lidar
   float time_unit_scale;
   int lidar_type, point_filter_num, N_SCANS, SCAN_RATE, time_unit;
+  bool use_point_timestamp = true;
+  bool point_timestamp_apply_filter_num = false;  // diagnostic: keep every point_filter_num-th point in the timestamp path  // false: legacy MID360 path (azimuth-derived times, point_filter_num)
   double blind;
   bool feature_enabled, given_offset_time;
   // ros::Publisher pub_full, pub_surf, pub_corn;

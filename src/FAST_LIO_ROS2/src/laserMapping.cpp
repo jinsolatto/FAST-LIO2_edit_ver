@@ -104,6 +104,87 @@ float DET_RANGE = 300.0f;
 const float MOV_THRESHOLD = 1.5f;
 double time_diff_lidar_to_imu = 0.0;
 
+// Online IMU-LiDAR time offset estimation. Angular rate from consecutive LiDAR-corrected
+// states (body frame, at the mid time) is compared with the gyro samples as stamped. For a
+// residual offset d, gyro(t) should match lidar_rate(t - d); d is found by maximising the
+// Pearson correlation over the last `window` seconds. A correction is applied only when the
+// rotation excites the estimate, the peak is clearly better than d = 0, |d| is at least a
+// quarter scan, and two consecutive evaluations agree. Otherwise nothing changes.
+struct TimeOffsetEstimator {
+    bool enabled = false;
+    double window = 30.0, period = 5.0, max_lag = 0.15, step = 0.002;
+    double min_apply = 0.025, min_corr = 0.7, min_gain = 0.05, agree = 0.010, min_rate_std = 0.05;
+    std::deque<std::pair<double, Eigen::Vector3d>> imu, lidar;
+    double last_eval = -1e100, last_state_t = std::numeric_limits<double>::quiet_NaN();
+    Eigen::Matrix3d last_R = Eigen::Matrix3d::Identity();
+    bool has_candidate = false; double candidate = 0.;
+    double applied_total = 0.; int applied_count = 0;
+    void pushImu(double t, const Eigen::Vector3d &w) {
+        if (!imu.empty() && t <= imu.back().first) return;
+        imu.emplace_back(t, w);
+        while (!imu.empty() && t - imu.front().first > window + 1.0) imu.pop_front();
+    }
+    void pushState(double t, const Eigen::Matrix3d &R) {
+        if (std::isfinite(last_state_t) && t > last_state_t + 1e-4 && t - last_state_t < 0.5) {
+            Eigen::AngleAxisd aa(last_R.transpose() * R);
+            lidar.emplace_back(0.5 * (t + last_state_t), aa.axis() * aa.angle() / (t - last_state_t));
+            while (!lidar.empty() && t - lidar.front().first > window + 1.0) lidar.pop_front();
+        }
+        last_state_t = t; last_R = R;
+    }
+    bool lidarAt(double t, Eigen::Vector3d &w) const {
+        if (lidar.size() < 2 || t < lidar.front().first || t > lidar.back().first) return false;
+        auto it = std::lower_bound(lidar.begin(), lidar.end(), t,
+            [](const std::pair<double, Eigen::Vector3d> &a, double v) { return a.first < v; });
+        if (it == lidar.begin()) { w = it->second; return true; }
+        auto pr = std::prev(it); const double a = (t - pr->first) / (it->first - pr->first);
+        w = (1 - a) * pr->second + a * it->second; return true;
+    }
+    double corrAt(double d, int &n) const {
+        double sx[3] = {0,0,0}, sy[3] = {0,0,0}, sxx = 0, syy = 0, sxy = 0; n = 0;
+        std::vector<std::pair<Eigen::Vector3d, Eigen::Vector3d>> pts;
+        const size_t stride = std::max<size_t>(1, imu.size() / 3000);
+        for (size_t i = 0; i < imu.size(); i += stride) {
+            Eigen::Vector3d l; if (!lidarAt(imu[i].first - d, l)) continue;
+            pts.emplace_back(imu[i].second, l);
+        }
+        n = int(pts.size()); if (n < 100) return std::numeric_limits<double>::quiet_NaN();
+        Eigen::Vector3d mx = Eigen::Vector3d::Zero(), my = Eigen::Vector3d::Zero();
+        for (auto &p : pts) { mx += p.first; my += p.second; }
+        mx /= n; my /= n;
+        for (auto &p : pts) { Eigen::Vector3d x = p.first - mx, y = p.second - my; sxx += x.squaredNorm(); syy += y.squaredNorm(); sxy += x.dot(y); }
+        (void)sx; (void)sy;
+        return (sxx > 0 && syy > 0) ? sxy / std::sqrt(sxx * syy) : std::numeric_limits<double>::quiet_NaN();
+    }
+    // Returns true and sets `apply` when a correction should be applied now.
+    bool evaluate(double now, double &apply, std::ostream &log) {
+        if (!enabled || now - last_eval < period) return false;
+        last_eval = now;
+        if (lidar.size() < 100 || imu.size() < 200) return false;
+        double m = 0, m2 = 0; for (auto &l : lidar) { m += l.second.norm(); m2 += l.second.squaredNorm(); }
+        const double rate_std = std::sqrt(std::max(0., m2 / lidar.size() - (m / lidar.size()) * (m / lidar.size())));
+        int n0 = 0; const double c0 = corrAt(0., n0);
+        double best = 0., cbest = -2.;
+        for (double d = -max_lag; d <= max_lag + 1e-9; d += step) {
+            int n = 0; const double c = corrAt(d, n);
+            if (std::isfinite(c) && c > cbest) { cbest = c; best = d; }
+        }
+        const bool ok = rate_std >= min_rate_std && std::isfinite(c0) && cbest >= min_corr &&
+                        cbest - c0 >= min_gain && std::abs(best) >= min_apply;
+        log << "TIME_OFFSET_EST t=" << std::setprecision(17) << now << " best=" << best << " corr=" << cbest
+            << " corr0=" << c0 << " rate_std=" << rate_std << " candidate=" << ok << std::endl;
+        if (!ok) { has_candidate = false; return false; }
+        if (has_candidate && std::abs(best - candidate) <= agree) {
+            apply = 0.5 * (best + candidate); has_candidate = false;
+            imu.clear(); lidar.clear(); last_state_t = std::numeric_limits<double>::quiet_NaN();
+            applied_total += apply; ++applied_count;
+            return true;
+        }
+        has_candidate = true; candidate = best; return false;
+    }
+};
+TimeOffsetEstimator g_time_offset;
+
 mutex mtx_buffer;
 condition_variable sig_buffer;
 
@@ -1103,6 +1184,20 @@ void imu_cbk(const sensor_msgs::msg::Imu::UniquePtr msg_in)
     sig_buffer.notify_all();
 }
 
+// Apply an online time-offset correction d (seconds): later IMU stamps become stamp - d,
+// and already buffered IMU messages are shifted the same way.
+void apply_imu_time_offset(double d)
+{
+    std::lock_guard<std::mutex> lock(mtx_buffer);
+    time_diff_lidar_to_imu += d;
+    for (auto &m : imu_buffer) {
+        sensor_msgs::msg::Imu::SharedPtr c(new sensor_msgs::msg::Imu(*m));
+        c->header.stamp = get_ros_time(get_time_sec(m->header.stamp) - d);
+        m = c;
+    }
+    last_timestamp_imu -= d;
+}
+
 double lidar_mean_scantime = 0.0;
 int    scan_num = 0;
 bool sync_packages(MeasureGroup &meas)
@@ -1707,6 +1802,45 @@ static void compute_post_scan2map_rmse(const state_ikfom &s_final,
     out_mean_abs = sumabs / out_count;
 }
 
+// Per-scan deskew consistency check. Both clouds are placed with the same prior state and
+// matched to the voxel map; on points matched in BOTH, a one-sided paired test on squared
+// point-to-plane residuals decides. Returns true when the raw (non-deskewed) cloud fits the
+// map significantly better (z < -z_crit), i.e. deskew is corrupting this scan.
+static bool deskew_hurts_scan(const PointCloudXYZI &deskewed, const PointCloudXYZI &raw,
+                              const state_ikfom &s, int max_points, double z_crit,
+                              int &pairs, double &z_out)
+{
+    pairs = 0; z_out = 0.;
+    if (!g_real_vp_inited || deskewed.size() != raw.size() || deskewed.empty()) return false;
+    const size_t step = std::max<size_t>(1, deskewed.size() / std::max(1, max_points));
+    const Eigen::Matrix3d Rli = s.offset_R_L_I.matrix();
+    const Eigen::Matrix3d Rwi = s.rot.matrix();
+    auto residual = [&](const PointType &pt, double &r) -> bool {
+        Eigen::Vector3d pb(pt.x, pt.y, pt.z);
+        Eigen::Vector3d wld = Rwi * (Rli * pb + s.offset_T_L_I) + s.pos;
+        Eigen::Matrix3d pvar; Eigen::Vector3d pbv = pb;
+        calc_body_var_port(pbv, 0.02, 0.05, pvar);
+        Eigen::Matrix3d var_world = Rwi * Rli * pvar * Rli.transpose() * Rwi.transpose();
+        vp::Plane *pla = nullptr; double sigma_d = 0; vp::OctoTree *oc = nullptr;
+        if (!vp::match(g_real_surf_map, wld, pla, var_world, sigma_d, oc) || !pla) return false;
+        r = pla->normal.dot(wld - pla->center);
+        return std::isfinite(r);
+    };
+    double sum = 0., sumsq = 0.;
+    for (size_t i = 0; i < deskewed.size(); i += step) {
+        double rd, rr;
+        if (!residual(deskewed.points[i], rd) || !residual(raw.points[i], rr)) continue;
+        const double d = rr * rr - rd * rd;   // < 0: raw fits better
+        sum += d; sumsq += d * d; ++pairs;
+    }
+    if (pairs < 30) return false;
+    const double mean = sum / pairs;
+    const double var = std::max(0., sumsq / pairs - mean * mean) * pairs / (pairs - 1);
+    if (!(var > 0.)) return false;
+    z_out = mean / std::sqrt(var / pairs);
+    return z_out < -z_crit;
+}
+
 class LaserMappingNode : public rclcpp::Node
 {
     friend class ImuExperimentReplay; // Deterministic bag regression harness only.
@@ -1878,6 +2012,8 @@ public:
         this->get_parameter_or<int>("preprocess.lidar_type", p_pre->lidar_type, AVIA);
         this->get_parameter_or<int>("preprocess.scan_line", p_pre->N_SCANS, 16);
         this->get_parameter_or<int>("preprocess.timestamp_unit", p_pre->time_unit, US);
+        p_pre->use_point_timestamp = this->declare_parameter<bool>("preprocess.use_point_timestamp", true);
+        p_pre->point_timestamp_apply_filter_num = this->declare_parameter<bool>("preprocess.point_timestamp_apply_filter_num", false);
         this->get_parameter_or<int>("preprocess.scan_rate", p_pre->SCAN_RATE, 10);
         this->get_parameter_or<int>("point_filter_num", p_pre->point_filter_num, 2);
         this->get_parameter_or<bool>("feature_extract_enable", p_pre->feature_enabled, false);
@@ -2108,11 +2244,29 @@ public:
         learner.warmup_h=this->declare_parameter<std::vector<double>>("mapping.gap_imu_only_warmup_h",std::vector<double>{.05,.1,.2,.3});
         const auto learner_csv=this->declare_parameter<std::string>("mapping.gap_imu_only_csv","/tmp/fastlio_gap_imu_only.csv");
         learner.adaptive_input=this->declare_parameter<bool>("mapping.gap_imu_only_adaptive_input",false);
+        learner.noise_from_differences=this->declare_parameter<bool>("mapping.gap_imu_only_noise_from_differences",false);
         learner.input_windows=this->declare_parameter<std::vector<double>>("mapping.gap_input_windows",std::vector<double>{.25,.5,1.,2.,4.,8.});
         p_imu->gap_input_min_dt=this->declare_parameter<double>("mapping.gap_input_min_dt",.0125);
         if(learner.adaptive_input && !learner.enabled)throw std::invalid_argument("Adaptive gap input requires IMU-only learning");
         if(!(p_imu->gap_input_min_dt>0))throw std::invalid_argument("Invalid gap_input_min_dt");
         p_imu->gap_cv_fixed=this->declare_parameter<bool>("mapping.gap_cv_fixed_enable",false);
+        p_imu->gap_cv_gyro_window=this->declare_parameter<double>("mapping.gap_cv_gyro_window",0.0);
+        p_imu->gap_gyro_change_test=this->declare_parameter<bool>("mapping.gap_gyro_change_test",false);
+        p_imu->deskew_lidar_cv_fallback=this->declare_parameter<bool>("mapping.deskew_lidar_cv_fallback",false);
+        p_imu->deskew_cv_max_imu_gap=this->declare_parameter<double>("mapping.deskew_cv_max_imu_gap",0.025);
+        if(!(p_imu->deskew_cv_max_imu_gap>0))throw std::invalid_argument("Invalid deskew_cv_max_imu_gap");
+        p_imu->deskew_anchor_at_state_time=this->declare_parameter<bool>("mapping.deskew_anchor_at_state_time",true);
+        deskew_check_enable_=this->declare_parameter<bool>("mapping.deskew_check_enable",false);
+        g_time_offset.enabled=this->declare_parameter<bool>("common.time_offset_online_enable",false);
+        g_time_offset.window=this->declare_parameter<double>("common.time_offset_online_window",30.0);
+        g_time_offset.min_apply=this->declare_parameter<double>("common.time_offset_online_min_apply",0.025);
+        deskew_check_max_points_=this->declare_parameter<int>("mapping.deskew_check_max_points",1500);
+        deskew_check_z_=this->declare_parameter<double>("mapping.deskew_check_z",2.326);
+        if(!(deskew_check_max_points_>=30 && deskew_check_z_>0))throw std::invalid_argument("Invalid deskew check parameters");
+        p_imu->gap_gyro_change_chi2=this->declare_parameter<double>("mapping.gap_gyro_change_chi2",11.345);
+        if(!(p_imu->gap_gyro_change_chi2>0))throw std::invalid_argument("Invalid gap_gyro_change_chi2");
+        if(p_imu->gap_gyro_change_test && !(learner.enabled && learner.adaptive_input))throw std::invalid_argument("Gyro change test requires adaptive IMU-only learning");
+        if(!(p_imu->gap_cv_gyro_window>=0 && p_imu->gap_cv_gyro_window<=30))throw std::invalid_argument("Invalid gap_cv_gyro_window");
         if(p_imu->gap_cv_fixed && (learner.enabled || !p_imu->gap_covariance_enable || !p_imu->gap_skip_empty))
             throw std::invalid_argument("Fixed constant-velocity gap rule requires fixed gap covariance, skip-empty, learning OFF");
         if(learner.enabled){
@@ -2457,6 +2611,26 @@ private:
             }
             const bool experiment_was_initialized = imu_propagation_experiment_ && p_imu->initialized();
             p_imu->Process(Measures, kf, feats_undistort);
+            // Deskew consistency check (optional): keep the raw scan when deskew makes it fit the
+            // map significantly worse. Same point order: Process sorts by time before deskewing.
+            if (deskew_check_enable_ && p_imu->deskew_enable && p_imu->initialized() &&
+                feats_undistort && !feats_undistort->empty())
+            {
+                PointCloudXYZI raw = *Measures.lidar;
+                std::sort(raw.points.begin(), raw.points.end(), time_list);
+                int pairs = 0; double z = 0.;
+                const bool use_raw = deskew_hurts_scan(*feats_undistort, raw, kf.get_x(),
+                                                       deskew_check_max_points_, deskew_check_z_, pairs, z);
+                ++deskew_check_scans_;
+                std::cout << "DESKEW_Z t=" << std::setprecision(17) << Measures.lidar_end_time
+                          << " z=" << z << " pairs=" << pairs << std::endl;
+                if (use_raw) {
+                    ++deskew_check_raw_;
+                    *feats_undistort = raw;
+                    std::cout << "DESKEW_CHECK raw scan_end=" << std::setprecision(17) << Measures.lidar_end_time
+                              << " pairs=" << pairs << " z=" << z << std::endl;
+                }
+            }
             // Learn only AFTER this scan's propagation. New densities affect future
             // scans; no retroactive use of the end-of-window IMU in this scan's P.
             if(p_imu->gap_imu_only.enabled && p_imu->initialized()) {
@@ -2608,6 +2782,34 @@ private:
                 for (int i = 0; i < 3; ++i) state_log << ',' << state_point.ba(i);
                 state_log << ',' << P.block<3,3>(12,12).trace() << ',' << P.block<3,3>(18,18).trace() << ',' << P.block<3,3>(15,15).trace() << '\n';
                 state_log.flush();
+            }
+            // LiDAR constant-velocity estimate for the deskew fallback (next scan).
+            if (p_imu->deskew_lidar_cv_fallback) {
+                static double cv_prev_t = std::numeric_limits<double>::quiet_NaN();
+                static M3D cv_prev_R = Eye3d; static V3D cv_prev_p = Zero3d;
+                const double t = Measures.lidar_end_time;
+                const M3D Rk = state_point.rot.toRotationMatrix();
+                if (std::isfinite(cv_prev_t) && t - cv_prev_t > 1e-3 && t - cv_prev_t < 0.5) {
+                    const double dt = t - cv_prev_t;
+                    p_imu->lidar_cv_w = Log(M3D(cv_prev_R.transpose() * Rk)) / dt;
+                    p_imu->lidar_cv_v = Rk.transpose() * (state_point.pos - cv_prev_p) / dt;
+                    p_imu->lidar_cv_valid = true;
+                } else p_imu->lidar_cv_valid = false;
+                cv_prev_t = t; cv_prev_R = Rk; cv_prev_p = state_point.pos;
+                if (p_imu->last_scan_used_cv)
+                    std::cout << "DESKEW_CV scan_end=" << std::setprecision(17) << t << std::endl;
+            }
+            if (g_time_offset.enabled && p_imu->initialized()) {
+                for (const auto &m : Measures.imu)
+                    g_time_offset.pushImu(get_time_sec(m->header.stamp),
+                        Eigen::Vector3d(m->angular_velocity.x, m->angular_velocity.y, m->angular_velocity.z));
+                g_time_offset.pushState(Measures.lidar_end_time, state_point.rot.toRotationMatrix());
+                double d = 0.;
+                if (g_time_offset.evaluate(Measures.lidar_end_time, d, std::cout)) {
+                    apply_imu_time_offset(d);
+                    std::cout << "TIME_OFFSET_APPLY t=" << std::setprecision(17) << Measures.lidar_end_time
+                              << " d=" << d << " total_time_diff=" << time_diff_lidar_to_imu << std::endl;
+                }
             }
             if(g_gap_consistency.enabled){
                 if(!g_gap_first_evaluation_logged)g_gap_consistency.unavailable();
@@ -3839,6 +4041,10 @@ private:
     int local_ba_next_frame_id_ = 0;
     bool local_ba_previous_map_pose_used_ba_ = false;
     bool imu_rate_low_mode_ = false;
+    bool deskew_check_enable_ = false;
+    int deskew_check_max_points_ = 1500;
+    double deskew_check_z_ = 2.326;   // one-sided 99 %
+    size_t deskew_check_scans_ = 0, deskew_check_raw_ = 0;
     double imu_rate_last_timestamp_ = std::numeric_limits<double>::quiet_NaN();
     double imu_rate_candidate_start_timestamp_ = std::numeric_limits<double>::quiet_NaN();
     deque<double> imu_rate_timestamps_;
