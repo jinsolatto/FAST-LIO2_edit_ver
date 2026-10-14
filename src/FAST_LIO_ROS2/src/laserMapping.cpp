@@ -2203,6 +2203,7 @@ public:
         p_imu->imu_trust_scale = imu_trust_scale;
         p_imu->deskew_enable = deskew_enable;
         p_imu->gap_covariance_enable = this->declare_parameter<bool>("mapping.gap_covariance_enable", false);
+        p_imu->gap_covariance_inject = this->declare_parameter<bool>("mapping.gap_covariance_inject", true);
         p_imu->gap_skip_empty = this->declare_parameter<bool>("mapping.gap_skip_empty", false);
         p_imu->gap_min_seconds = this->declare_parameter<double>("mapping.gap_min_seconds", 0.1);
         auto gap_g = this->declare_parameter<std::vector<double>>("mapping.gap_q_alpha", std::vector<double>{0.,0.,0.});
@@ -2266,6 +2267,44 @@ public:
         p_imu->gap_gyro_change_chi2=this->declare_parameter<double>("mapping.gap_gyro_change_chi2",11.345);
         if(!(p_imu->gap_gyro_change_chi2>0))throw std::invalid_argument("Invalid gap_gyro_change_chi2");
         if(p_imu->gap_gyro_change_test && !(learner.enabled && learner.adaptive_input))throw std::invalid_argument("Gyro change test requires adaptive IMU-only learning");
+        p_imu->gap_input_fixed_gyro = this->declare_parameter<double>("mapping.gap_input_fixed_gyro", -1.0);
+        p_imu->gap_input_fixed_acc = this->declare_parameter<double>("mapping.gap_input_fixed_acc", -1.0);
+        p_imu->gap_input_fixed_acc_cv = this->declare_parameter<bool>("mapping.gap_input_fixed_acc_cv", false);
+        p_imu->gap_dp_fixed = this->declare_parameter<bool>("mapping.gap_dp_fixed", false);
+        p_imu->gap_imu_only.learn_cv = this->declare_parameter<bool>("mapping.gap_learn_cv", false);
+        if (p_imu->gap_imu_only.learn_cv) RCLCPP_WARN(this->get_logger(), "LEARN CV: dP for the constant-velocity fill is learned from its own virtual-gap error");
+        p_imu->gap_input_optimal_window = this->declare_parameter<bool>("mapping.gap_input_optimal_window", false);
+        p_imu->gap_dp_from_window_mse = this->declare_parameter<bool>("mapping.gap_dp_from_window_mse", true);
+        p_imu->ow_tau = this->declare_parameter<double>("mapping.gap_ow_tau", 5.0);
+        p_imu->ow_max_dt = this->declare_parameter<double>("mapping.gap_ow_max_dt", 0.0125);
+        p_imu->gap_ow_allan = this->declare_parameter<bool>("mapping.gap_ow_allan", false);
+        p_imu->allan_max_tau = this->declare_parameter<double>("mapping.gap_ow_allan_max_tau", 4.2);
+        if (p_imu->gap_ow_allan) RCLCPP_WARN(this->get_logger(), "ALLAN MODE: W* = argmin AVAR(tau) on octave grid up to %.2f s; dP from 2 AVAR(W*)", p_imu->allan_max_tau);
+        if (p_imu->gap_input_optimal_window) {
+            if (!(p_imu->ow_tau > 0. && p_imu->ow_max_dt > 0.)) throw std::invalid_argument("Invalid gap_ow_* parameters");
+            RCLCPP_WARN(this->get_logger(), "OPTIMAL WINDOW MODE: gap input = mean of last W*, W* from r2 (W+h) W^2 = 2 s2/f; dP from MSE=%d",
+                        (int)p_imu->gap_dp_from_window_mse);
+        }
+        {
+            const auto fa = this->declare_parameter<std::vector<double>>("mapping.gap_dp_fixed_alpha", std::vector<double>{0.,0.,0.});
+            const auto fc = this->declare_parameter<std::vector<double>>("mapping.gap_dp_fixed_accel", std::vector<double>{0.,0.,0.});
+            if (fa.size()!=3 || fc.size()!=3) throw std::invalid_argument("gap_dp_fixed_alpha/accel need 3 values");
+            for (int k=0;k<3;++k){ if(!(fa[k]>=0. && fc[k]>=0.)) throw std::invalid_argument("gap_dp_fixed_* must be >= 0");
+                p_imu->gap_dp_fixed_alpha(k,k)=fa[k]; p_imu->gap_dp_fixed_accel(k,k)=fc[k]; }
+            if (p_imu->gap_dp_fixed) RCLCPP_WARN(this->get_logger(), "COMPARISON MODE: fixed gap dP alpha=[%.4f %.4f %.4f] accel=[%.4f %.4f %.4f]",
+                fa[0],fa[1],fa[2],fc[0],fc[1],fc[2]);
+        }
+        {
+            const bool fixed = p_imu->gap_input_fixed_gyro >= 0. || p_imu->gap_input_fixed_acc >= 0. || p_imu->gap_input_fixed_acc_cv;
+            auto in_windows = [&](double sec) { if (sec <= 0.) return true;
+                for (double w : learner.input_windows) if (std::abs(w - sec) < 1e-6) return true; return false; };
+            if (fixed && !(learner.enabled && learner.adaptive_input))
+                throw std::invalid_argument("Fixed gap input comparison requires adaptive IMU-only learning (densities)");
+            if (!in_windows(p_imu->gap_input_fixed_gyro) || !in_windows(p_imu->gap_input_fixed_acc))
+                throw std::invalid_argument("gap_input_fixed_* must be 0, -1 or one of gap_input_windows");
+            if (fixed) RCLCPP_WARN(this->get_logger(), "COMPARISON MODE: fixed gap input gyro=%.2f acc=%.2f acc_cv=%d",
+                                   p_imu->gap_input_fixed_gyro, p_imu->gap_input_fixed_acc, (int)p_imu->gap_input_fixed_acc_cv);
+        }
         if(!(p_imu->gap_cv_gyro_window>=0 && p_imu->gap_cv_gyro_window<=30))throw std::invalid_argument("Invalid gap_cv_gyro_window");
         if(p_imu->gap_cv_fixed && (learner.enabled || !p_imu->gap_covariance_enable || !p_imu->gap_skip_empty))
             throw std::invalid_argument("Fixed constant-velocity gap rule requires fixed gap covariance, skip-empty, learning OFF");
@@ -2634,6 +2673,12 @@ private:
             // Learn only AFTER this scan's propagation. New densities affect future
             // scans; no retroactive use of the end-of-window IMU in this scan's P.
             if(p_imu->gap_imu_only.enabled && p_imu->initialized()) {
+                if (p_imu->gap_imu_only.learn_cv) {   // gravity-in-body and accel bias for the CV candidate
+                    const state_ikfom xs = kf.get_x();
+                    const V3D gw(xs.grav[0], xs.grav[1], xs.grav[2]);
+                    p_imu->gap_imu_only.cv_g_body = xs.rot.toRotationMatrix().transpose() * gw;
+                    p_imu->gap_imu_only.cv_ba = xs.ba;
+                }
                 for(const auto& m:Measures.imu) {
                     ImuOnlyGapLearning::Sample sample;
                     sample.t=rclcpp::Time(m->header.stamp).seconds();

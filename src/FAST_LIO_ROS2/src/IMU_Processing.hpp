@@ -63,6 +63,7 @@ class ImuProcess
   std::string gap_block_mode = "full";
   std::ofstream gap_applied_log;
   bool gap_covariance_enable = false;
+  bool gap_covariance_inject = true;   // ablation: false keeps all gap bookkeeping/learning but adds no dP
   bool gap_skip_empty = false;
   double gap_min_seconds = 0.1;
   // Adaptive gap input (requires gap_imu_only.adaptive_input and a ready learner).
@@ -85,6 +86,13 @@ class ImuProcess
   // the endpoint average within IMU noise (chi-square, 3 dof); otherwise the angular rate
   // is changing (window mean lags) and the endpoint average is used.
   bool gap_gyro_change_test = false;
+  // Comparison baselines (default off): force one candidate instead of the learned selection.
+  // Seconds of the window mean (0 = endpoint average, -1 = learned). Learned densities, gyro test, dP unchanged.
+  double gap_input_fixed_gyro = -1.0, gap_input_fixed_acc = -1.0;
+  bool gap_input_fixed_acc_cv = false;   // constant-velocity acc (gravity+bias only) instead of any candidate
+  // Comparison (default off): use these fixed gap densities instead of the learned ones (dP not learned).
+  bool gap_dp_fixed = false;
+  Eigen::Matrix3d gap_dp_fixed_alpha = Eigen::Matrix3d::Zero(), gap_dp_fixed_accel = Eigen::Matrix3d::Zero();
   double gap_gyro_change_chi2 = 11.345;  // chi2(3) 99 %
   size_t gyro_change_rejects = 0;
   // Fixed-rule baseline: for the same intervals, replace the acceleration input by the
@@ -135,6 +143,36 @@ class ImuProcess
     return (x.ba - x.rot.conjugate() * g) / accel_scale_;
   }
   struct RawImu { double t; V3D w, a; };
+ public:
+  // ---- Optimal-window gap input (default off; added alongside the learned selection) ----
+  // Fill a gap of length h with the mean of the last W seconds. Per axis, the error of that mean against
+  // the true mean over the gap is   MSE(W) = r2*(W+h)^2/4  (signal change, r2 = E[d s/dt ^2])
+  //                                       + s2/(f*W)      (white vibration noise, s2 per sample, rate f).
+  // dMSE/dW = 0  ->  r2*(W+h)*W^2 = 2*s2/f.  s2 and r2 are estimated online from dense IMU only.
+  bool gap_input_optimal_window = false;
+  bool gap_dp_from_window_mse = true;   // dP from the same MSE (velocity var = MSE_a h^2, angle var = MSE_g h^2)
+  double ow_tau = 5.0;                  // EMA time constant of the noise/change estimates [s]
+  double ow_max_dt = 0.0125;            // samples closer than this count as dense
+  struct OwStat { double s2 = NAN, r2 = NAN; };
+  OwStat ow_acc_, ow_gyr_;
+  double ow_rate_ = NAN, ow_last_r2_t_ = -1.0, ow_W_acc_ = 1.0, ow_W_gyr_ = 1.0;
+  std::deque<RawImu> ow_dense_;         // current dense run (cleared at any sample gap > ow_max_dt)
+  size_t ow_updates_ = 0;
+  // ---- Allan-variance window (default off; refines the optimal window, no W<->r2 feedback loop) ----
+  // On an octave grid tau_k = 2^k / f0, AVAR(tau) = 1/2 E|mean(t-tau,t] - mean(t-2tau,t-tau]|^2 (per axis),
+  // measured continuously on all received samples. W* = argmin_k AVAR(tau_k); fill error var ~ 2 AVAR(W*).
+  bool gap_ow_allan = false;
+  double allan_max_tau = 4.2;            // largest tau evaluated [s] (history kept accordingly)
+  std::vector<double> allan_tau_;        // octave grid, fixed at first dense-rate estimate
+  std::vector<double> allan_acc_, allan_gyr_;   // EMA of AVAR per tau (NaN until first sample)
+  double allan_last_t_ = -1.0;
+  void allanUpdate(double t);
+  size_t allanArgmin(const std::vector<double> &v) const;
+  void owPush(const RawImu &r);
+  double owSolveW(const OwStat &st, double h, double wmax) const;
+  bool owChoose(double head_t, const sensor_msgs::msg::Imu::ConstSharedPtr &tail, double h,
+                V3D &w, V3D &a, double &q_alpha, double &q_accel, std::string &tag);
+ private:
   std::deque<RawImu> input_hist_;
   void pushInputHistory(const sensor_msgs::msg::Imu::ConstSharedPtr &m);
   // Replaces w/a (raw units) for an interval of length h ending at `tail` (nullptr:
@@ -151,8 +189,184 @@ void ImuProcess::pushInputHistory(const sensor_msgs::msg::Imu::ConstSharedPtr &m
   if (!input_hist_.empty() && t <= input_hist_.back().t) return;
   input_hist_.push_back({t, V3D(m->angular_velocity.x, m->angular_velocity.y, m->angular_velocity.z),
                          V3D(m->linear_acceleration.x, m->linear_acceleration.y, m->linear_acceleration.z)});
-  while (!input_hist_.empty() && t - input_hist_.front().t > std::max(gap_imu_only.maxWindow(), gap_cv_gyro_window) + 1.0) input_hist_.pop_front();
+  const double keep_s = std::max(std::max(gap_imu_only.maxWindow(), gap_cv_gyro_window) + 1.0,
+                                 gap_ow_allan ? 2.0 * allan_max_tau + 0.1 : 0.0);
+  while (!input_hist_.empty() && t - input_hist_.front().t > keep_s) input_hist_.pop_front();
+  if (gap_input_optimal_window) owPush(input_hist_.back());
+  if (gap_input_optimal_window && gap_ow_allan) allanUpdate(t);
 }
+
+void ImuProcess::owPush(const RawImu &r)
+{
+  if (!ow_dense_.empty() && r.t - ow_dense_.back().t > ow_max_dt) ow_dense_.clear();
+  ow_dense_.push_back(r);
+  const size_t n = ow_dense_.size();
+  // Vibration noise per sample from second differences (removes linear trends): var(d2) = 6 s2.
+  if (n >= 3) {
+    const auto &x0 = ow_dense_[n-3], &x1 = ow_dense_[n-2], &x2 = ow_dense_[n-1];
+    const double dt = x2.t - x1.t;
+    const double wgt = std::min(1.0, dt / ow_tau);
+    const double ea = (x2.a - 2.*x1.a + x0.a).squaredNorm() / (6. * 3.);   // per axis
+    const double eg = (x2.w - 2.*x1.w + x0.w).squaredNorm() / (6. * 3.);
+    ow_acc_.s2 = std::isfinite(ow_acc_.s2) ? (1.-wgt)*ow_acc_.s2 + wgt*ea : ea;
+    ow_gyr_.s2 = std::isfinite(ow_gyr_.s2) ? (1.-wgt)*ow_gyr_.s2 + wgt*eg : eg;
+    const double f = 1. / std::max(dt, 1e-4);
+    ow_rate_ = std::isfinite(ow_rate_) ? (1.-wgt)*ow_rate_ + wgt*f : f;
+  }
+  // Signal change rate from two adjacent windows of length L (L = current W, self-consistent):
+  // E|m2-m1|^2 = r2 L^2 + 2 s2/(f L)  per axis.
+  auto update_r2 = [&](OwStat &st, double L, bool acc) {
+    if (!(L > 0.) || !std::isfinite(st.s2) || !std::isfinite(ow_rate_)) return false;
+    if (ow_dense_.back().t - ow_dense_.front().t < 2.*L) return false;
+    const double t1 = ow_dense_.back().t - L, t0 = t1 - L;
+    V3D m1 = V3D::Zero(), m2 = V3D::Zero(); int n1 = 0, n2 = 0;
+    for (auto it = ow_dense_.rbegin(); it != ow_dense_.rend() && it->t >= t0; ++it) {
+      const V3D &v = acc ? it->a : it->w;
+      if (it->t >= t1) { m2 += v; ++n2; } else { m1 += v; ++n1; }
+    }
+    if (n1 < 2 || n2 < 2) return false;
+    m1 /= n1; m2 /= n2;
+    const double d = (m2 - m1).squaredNorm() / 3.;
+    const double est = std::max(d - st.s2 * (1./n1 + 1./n2), 0.) / (L * L);
+    const double wgt = std::min(1.0, (ow_dense_.back().t - std::max(ow_last_r2_t_, ow_dense_.back().t - ow_tau)) / ow_tau);
+    st.r2 = std::isfinite(st.r2) ? (1.-wgt)*st.r2 + wgt*est : est;
+    return true;
+  };
+  // Re-estimate change rates at most every 0.05 s of dense data (cost only).
+  if (ow_dense_.back().t - ow_last_r2_t_ >= 0.05) {
+    const bool ua = update_r2(ow_acc_, ow_W_acc_, true), ug = update_r2(ow_gyr_, ow_W_gyr_, false);
+    if (ua || ug) { ow_last_r2_t_ = ow_dense_.back().t; ++ow_updates_;
+      const double wmax = std::max(gap_imu_only.maxWindow(), gap_cv_gyro_window);   // history actually kept
+      ow_W_acc_ = owSolveW(ow_acc_, 0., wmax); ow_W_gyr_ = owSolveW(ow_gyr_, 0., wmax);
+      // Convergence log (1 Hz): W feeds back into the r2 window length, so watch for oscillation.
+      static double last_log = -1.;
+      if (ow_dense_.back().t - last_log >= 1.0) { last_log = ow_dense_.back().t;
+        std::cout << std::setprecision(17) << "OW_EST t=" << last_log << std::setprecision(6)
+                  << " f=" << ow_rate_ << " acc_s2=" << ow_acc_.s2 << " acc_r2=" << ow_acc_.r2 << " Wa=" << ow_W_acc_
+                  << " gyr_s2=" << ow_gyr_.s2 << " gyr_r2=" << ow_gyr_.r2 << " Wg=" << ow_W_gyr_ << std::endl; } }
+  }
+}
+
+void ImuProcess::allanUpdate(double t)
+{
+  if (allan_tau_.empty()) {
+    if (!std::isfinite(ow_rate_) || ow_rate_ <= 0.) return;
+    for (double tau = 1. / ow_rate_; tau <= allan_max_tau + 1e-9; tau *= 2.) allan_tau_.push_back(tau);
+    allan_acc_.assign(allan_tau_.size(), NAN); allan_gyr_.assign(allan_tau_.size(), NAN);
+  }
+  if (t - allan_last_t_ < 0.05) return;                 // evaluation cadence (cost only)
+  const double wgt = allan_last_t_ < 0. ? 1. : std::min(1.0, (t - allan_last_t_) / ow_tau);
+  allan_last_t_ = t;
+  for (size_t k = 0; k < allan_tau_.size(); ++k) {
+    const double tau = allan_tau_[k];
+    if (input_hist_.empty() || t - input_hist_.front().t < 2. * tau) break;
+    V3D a1 = V3D::Zero(), a2 = V3D::Zero(), g1 = V3D::Zero(), g2 = V3D::Zero(); int n1 = 0, n2 = 0;
+    for (auto it = input_hist_.rbegin(); it != input_hist_.rend() && it->t > t - 2. * tau; ++it) {
+      if (it->t > t - tau) { a2 += it->a; g2 += it->w; ++n2; } else { a1 += it->a; g1 += it->w; ++n1; }
+    }
+    if (n1 < 1 || n2 < 1) continue;
+    const double va = 0.5 * (a2 / n2 - a1 / n1).squaredNorm() / 3., vg = 0.5 * (g2 / n2 - g1 / n1).squaredNorm() / 3.;
+    allan_acc_[k] = std::isfinite(allan_acc_[k]) ? (1. - wgt) * allan_acc_[k] + wgt * va : va;
+    allan_gyr_[k] = std::isfinite(allan_gyr_[k]) ? (1. - wgt) * allan_gyr_[k] + wgt * vg : vg;
+  }
+  static double last_log = -1.;
+  if (t - last_log >= 1.0 && !allan_tau_.empty()) {
+    last_log = t;
+    const size_t ka = allanArgmin(allan_acc_), kg = allanArgmin(allan_gyr_);
+    std::cout << std::setprecision(17) << "ALLAN_EST t=" << t << std::setprecision(5)
+              << " Wa=" << (ka < allan_tau_.size() ? allan_tau_[ka] : NAN) << " avar_a=" << (ka < allan_tau_.size() ? allan_acc_[ka] : NAN)
+              << " Wg=" << (kg < allan_tau_.size() ? allan_tau_[kg] : NAN) << " avar_g=" << (kg < allan_tau_.size() ? allan_gyr_[kg] : NAN)
+              << " curve_a=";
+    for (size_t k = 0; k < allan_tau_.size(); ++k) std::cout << (k ? "," : "") << allan_acc_[k];
+    std::cout << " curve_g=";
+    for (size_t k = 0; k < allan_tau_.size(); ++k) std::cout << (k ? "," : "") << allan_gyr_[k];
+    std::cout << std::endl;
+  }
+}
+
+size_t ImuProcess::allanArgmin(const std::vector<double> &v) const
+{
+  size_t best = v.size(); double bv = INFINITY;
+  for (size_t k = 0; k < v.size(); ++k) if (std::isfinite(v[k]) && v[k] < bv) { bv = v[k]; best = k; }
+  return best;
+}
+
+double ImuProcess::owSolveW(const OwStat &st, double h, double wmax) const
+{
+  // Root of g(W) = r2 (W+h) W^2 - 2 s2/f on (0, wmax]; g is increasing in W, so bisection is exact enough.
+  const double lo_cap = 1. / std::max(ow_rate_, 1.);          // at least one sample period
+  if (!std::isfinite(st.s2) || !std::isfinite(ow_rate_)) return wmax;
+  if (!std::isfinite(st.r2) || st.r2 <= 0.) return wmax;      // no measurable change: average all history
+  const double c = 2. * st.s2 / ow_rate_;
+  auto g = [&](double W) { return st.r2 * (W + h) * W * W - c; };
+  if (g(wmax) <= 0.) return wmax;
+  if (g(lo_cap) >= 0.) return lo_cap;
+  double a = lo_cap, b = wmax;
+  for (int i = 0; i < 60; ++i) { const double m = 0.5*(a+b); (g(m) > 0. ? b : a) = m; }
+  return 0.5*(a+b);
+}
+
+bool ImuProcess::owChoose(double head_t, const sensor_msgs::msg::Imu::ConstSharedPtr &tail, double h,
+                          V3D &w, V3D &a, double &q_alpha, double &q_accel, std::string &tag)
+{
+  if (!std::isfinite(ow_acc_.s2) || !std::isfinite(ow_gyr_.s2) || !std::isfinite(ow_rate_)) return false;
+  const double wmax = std::max(gap_imu_only.maxWindow(), gap_cv_gyro_window);
+  double Wa = owSolveW(ow_acc_, h, wmax), Wg = owSolveW(ow_gyr_, h, wmax);
+  size_t allan_ka = allan_tau_.size(), allan_kg = allan_tau_.size();
+  if (gap_ow_allan) {
+    allan_ka = allanArgmin(allan_acc_); allan_kg = allanArgmin(allan_gyr_);
+    if (allan_ka >= allan_tau_.size() || allan_kg >= allan_tau_.size()) return false;   // not ready: fall back
+    Wa = allan_tau_[allan_ka]; Wg = allan_tau_[allan_kg];
+  }
+  V3D ma = V3D::Zero(), mw = V3D::Zero(); int na = 0, ng = 0;
+  for (const auto &r : input_hist_) {
+    if (r.t > head_t) continue;
+    if (r.t >= head_t - Wa) { ma += r.a; ++na; }
+    if (r.t >= head_t - Wg) { mw += r.w; ++ng; }
+  }
+  if (tail) {
+    const V3D tw(tail->angular_velocity.x, tail->angular_velocity.y, tail->angular_velocity.z);
+    const V3D ta(tail->linear_acceleration.x, tail->linear_acceleration.y, tail->linear_acceleration.z);
+    ma += ta; ++na; mw += tw; ++ng;
+  }
+  if (na < 2 || ng < 2) return false;
+  a = ma / na;
+  bool rejected = false;
+  const V3D wmean = mw / ng;
+  if (gap_gyro_change_test) {   // same test as the learned path, with this estimator's own noise
+    const double var = ow_gyr_.s2 * (0.5 + 1.0 / ng);
+    rejected = !(var > 0.) || (w - wmean).squaredNorm() / var > gap_gyro_change_chi2;
+  }
+  if (!rejected) w = wmean; else ++gyro_change_rejects;
+  // Per-axis MSE of the used means (raw units) -> densities for the existing discrete dP model.
+  auto mse = [&](const OwStat &st, double W, int n) {
+    return (std::isfinite(st.r2) ? st.r2 : 0.) * (W + h) * (W + h) / 4. + st.s2 / std::max(n, 1); };
+  double mse_a = mse(ow_acc_, Wa, na) * accel_scale_ * accel_scale_;
+  double mse_g = rejected ? ow_gyr_.s2 / 2. : mse(ow_gyr_, Wg, ng);
+  if (gap_ow_allan) {   // error of a window mean vs the next interval: 2 AVAR(W*) (per axis)
+    mse_a = 2. * allan_acc_[allan_ka] * accel_scale_ * accel_scale_;
+    mse_g = rejected ? (std::isfinite(allan_gyr_[0]) ? 2. * allan_gyr_[0] : ow_gyr_.s2 / 2.) : 2. * allan_gyr_[allan_kg];
+  }
+  if (gap_dp_from_window_mse && h > 0.) { q_accel = mse_a * h; q_alpha = 3. * mse_g / h; }
+  else if (!gap_dp_from_window_mse && gap_imu_only.enabled && gap_imu_only.ready() && !gap_imu_only.qr_c.empty() && h > 0.) {
+    // Cause-separation option: v6 window for the fill, but v5's learned candidate densities for dP
+    // (candidate nearest in log-window to the window actually used; same noise terms as chooseGapInput).
+    const auto &L = gap_imu_only;
+    auto nearest = [&](double W) -> size_t {
+      if (W < 0.5 * L.input_windows.front()) return 0;
+      size_t best = 1; double bd = INFINITY;
+      for (size_t k = 1; k <= L.input_windows.size(); ++k) { const double d = std::abs(std::log(W / L.input_windows[k-1])); if (d < bd) { bd = d; best = k; } }
+      return best; };
+    const size_t kg = rejected ? 0 : nearest(Wg), ka = nearest(Wa);
+    q_alpha = L.qr_c[kg] + (kg ? 3. * L.noise_gyr / (std::max(ng, 1) * h) : 0.);
+    q_accel = L.qp_c[ka] + (ka ? L.noise_acc * h / std::max(na, 1) : 0.);
+  }
+  std::ostringstream os; os.precision(3);
+  os << (gap_ow_allan ? "allan:g" : "ow:g") << (rejected ? 0. : Wg) << (rejected ? "t" : "") << "/n" << ng << ",a" << Wa << "/n" << na;
+  tag = os.str();
+  return true;
+}
+
 
 void ImuProcess::chooseGapInput(double head_t, const sensor_msgs::msg::Imu::ConstSharedPtr &tail, double h,
                                 V3D &w, V3D &a, double &q_alpha, double &q_accel, std::string &tag)
@@ -183,6 +397,15 @@ void ImuProcess::chooseGapInput(double head_t, const sensor_msgs::msg::Imu::Cons
     if (L.qr_c[k] + ng < best_g) { best_g = L.qr_c[k] + ng; g = k; noise_g = ng; }
     if (L.qv_c[k] + na < best_a) { best_a = L.qv_c[k] + na; c = k; noise_a = na; }
   }
+  auto fixed_index = [&](double sec) -> size_t {
+    if (sec <= 0.) return 0;
+    for (size_t k = 1; k < K; ++k) if (std::abs(L.input_windows[k-1] - sec) < 1e-6) return n[k] >= 2 ? k : 0;
+    return 0;
+  };
+  if (gap_input_fixed_gyro >= 0.) { g = fixed_index(gap_input_fixed_gyro); noise_g = g ? 3. * L.noise_gyr / (n[g] * h) : 0.; }
+  if (gap_input_fixed_acc >= 0. || gap_input_fixed_acc_cv) {
+    c = gap_input_fixed_acc_cv ? 0 : fixed_index(gap_input_fixed_acc); noise_a = c ? L.noise_acc * h / n[c] : 0.;
+  }
   bool rejected = false;
   if (g && gap_gyro_change_test && gyroChanging(w, mw[g] / n[g], n[g])) {
     // Case 2: rotation changing -> endpoint gyro and its own learned density.
@@ -192,6 +415,7 @@ void ImuProcess::chooseGapInput(double head_t, const sensor_msgs::msg::Imu::Cons
   if (c) a = ma[c] / n[c];   // raw units, like the endpoint average (scaled by the caller)
   q_alpha = L.qr_c[g] + noise_g;
   q_accel = L.qp_c[c] + noise_a;
+  if (gap_input_fixed_acc_cv && L.learn_cv && L.cv_updates > 0) q_accel = L.qp_cv;   // dP learned for the CV fill itself
   std::ostringstream os;
   os << "g" << (g ? L.input_windows[g-1] : 0.) << (rejected ? "t" : "") << "/n" << n[g] << ",a" << (c ? L.input_windows[c-1] : 0.) << "/n" << n[c];
   tag = os.str();
@@ -392,9 +616,17 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     pushInputHistory(head);
     std::string gap_input = "native";
     Eigen::Matrix3d interval_q_alpha = gap_q_alpha, interval_q_accel = gap_q_accel_world;
-    if (gap_input_adaptive && tail_stamp - head_stamp > gap_input_min_dt) {
+    bool ow_used = false;
+    if (gap_input_optimal_window && tail_stamp - head_stamp > gap_input_min_dt) {
+      double qa_eff = interval_q_alpha(0,0), qacc_eff = interval_q_accel(0,0);
+      ow_used = owChoose(head_stamp, tail, tail_stamp - head_stamp, angvel_avr, acc_avr, qa_eff, qacc_eff, gap_input);
+      if (ow_used) { interval_q_alpha = Eigen::Matrix3d::Identity() * qa_eff; interval_q_accel = Eigen::Matrix3d::Identity() * qacc_eff; }
+    }
+    if (ow_used) {
+    } else if (gap_input_adaptive && tail_stamp - head_stamp > gap_input_min_dt) {
       double qa_eff, qacc_eff;
       chooseGapInput(head_stamp, tail, tail_stamp - head_stamp, angvel_avr, acc_avr, qa_eff, qacc_eff, gap_input);
+      if (gap_input_fixed_acc_cv) { acc_avr = constantVelocityAcc(kf_state.get_x()); gap_input += ",cv"; }
       interval_q_alpha = Eigen::Matrix3d::Identity() * qa_eff;
       interval_q_accel = Eigen::Matrix3d::Identity() * qacc_eff;
     } else if (gap_cv_fixed && tail_stamp - head_stamp > gap_input_min_dt) {
@@ -408,6 +640,8 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
         gap_input = "cv_fixed_gyro_window";
       }
     }
+
+    if (gap_dp_fixed) { interval_q_alpha = gap_dp_fixed_alpha; interval_q_accel = gap_dp_fixed_accel; gap_input += ",dpfix"; }
 
     // fout_imu << setw(10) << head->header.stamp.toSec() - first_lidar_time << " " << angvel_avr.transpose() << " " << acc_avr.transpose() << endl;
 
@@ -447,9 +681,11 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
         for(int i=0;i<3;++i)gap_applied_log<<','<<interval_q_accel(i,i);
         gap_applied_log<<','<<added.block<3,3>(3,3).trace()<<','<<added.block<3,3>(12,12).trace()<<','<<added.block<3,3>(0,0).trace()<<'\n';gap_applied_log.flush();
       }
-      auto covariance = kf_state.get_P();
-      covariance += added;
-      kf_state.change_P(covariance);
+      if (gap_covariance_inject) {
+        auto covariance = kf_state.get_P();
+        covariance += added;
+        kf_state.change_P(covariance);
+      }
       gap_adaptive.addGap(dt);
       if(gap_imu_only.enabled) gap_imu_only_pending.emplace_back(dt,tail_stamp);
       std::cout << "GAP_DP head=" << std::setprecision(17) << head_stamp
@@ -477,11 +713,20 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   dt = note * (pcl_end_time - imu_end_time);
   // Scan-end tail extrapolation has the same single-sample input problem.
   // No covariance is added for the tail (unchanged); only the mean input.
-  if (gap_input_adaptive && note > 0 && dt > gap_input_min_dt) {
+  bool ow_tail = false;
+  if (gap_input_optimal_window && note > 0 && dt > gap_input_min_dt) {
+    pushInputHistory(v_imu.back());
+    V3D w = in.gyro, a = in.acc / accel_scale_;
+    double qa_eff = 0., qacc_eff = 0.; std::string tag;
+    if (owChoose(imu_end_time, nullptr, dt, w, a, qa_eff, qacc_eff, tag)) { in.gyro = w; in.acc = a * accel_scale_; ow_tail = true; }
+  }
+  if (ow_tail) {
+  } else if (gap_input_adaptive && note > 0 && dt > gap_input_min_dt) {
     pushInputHistory(v_imu.back());
     V3D w = in.gyro, a = in.acc / accel_scale_;
     double qa_eff, qacc_eff; std::string tag;
     chooseGapInput(imu_end_time, nullptr, dt, w, a, qa_eff, qacc_eff, tag);
+    if (gap_input_fixed_acc_cv) a = constantVelocityAcc(kf_state.get_x());
     in.gyro = w; in.acc = a * accel_scale_;
   } else if (gap_cv_fixed && note > 0 && dt > gap_input_min_dt) {
     in.acc = constantVelocityAcc(kf_state.get_x()) * accel_scale_;

@@ -29,6 +29,11 @@ public:
   bool adaptive_input=false;
   std::vector<double> input_windows{.25,.5,1.,2.,4.,8.};
   std::vector<double> qr_c,qp_c,qv_c; // per-candidate densities (rotation, position, velocity)
+  // Constant-velocity (CV) fill candidate (default off). Its error over a hidden interval is the true
+  // velocity/position change, integrated in the body frame at the interval start with the filter's
+  // current gravity-in-body and accel bias (roll/pitch assumed constant over <= max_h).
+  bool learn_cv=false; Eigen::Vector3d cv_g_body=Eigen::Vector3d::Zero(), cv_ba=Eigen::Vector3d::Zero();
+  double qp_cv=0., qv_cv=0., cp_cv=0., cv_cv=0.; size_t cv_updates=0;
   double noise_gyr=0.,noise_acc=0.;   // per-axis per-sample variance
   // true: noise from successive-sample differences (var(x_{k+1}-x_k)/2), which is insensitive
   // to real motion between 5 ms samples; false: spread about the window mean (includes motion).
@@ -164,6 +169,19 @@ private:
     for(size_t c=0;c<K;++c){
       cr[c]=a*cr[c]+(1-a)*r2[c];cp[c]=a*cp[c]+(1-a)*p2[c];cv[c]=a*cv[c]+(1-a)*v2[c]*h*h/3.;
       qr_c[c]=cr[c]/den;qp_c[c]=cp[c]/den;qv_c[c]=cv[c]/den;
+    }
+    if(learn_cv){
+      Eigen::Matrix3d R=Eigen::Matrix3d::Identity();Eigen::Vector3d v=Eigen::Vector3d::Zero(),p=Eigen::Vector3d::Zero();
+      for(int k=start;k<end;++k){
+        const double dt=history[k+1].t-history[k].t;
+        const Eigen::Vector3d w=.5*(history[k].w+history[k+1].w),acc=.5*(history[k].a+history[k+1].a);
+        const Eigen::Vector3d f=R*(acc-cv_ba)+cv_g_body;
+        p+=v*dt+.5*f*dt*dt;v+=f*dt;
+        const double th=(w*dt).norm();
+        if(th>1e-12)R=R*Eigen::AngleAxisd(th,(w*dt)/th).toRotationMatrix();
+      }
+      const double v2c=v.squaredNorm(),p2c=p.squaredNorm();
+      if(std::isfinite(v2c+p2c)){cp_cv=a*cp_cv+(1-a)*p2c;cv_cv=a*cv_cv+(1-a)*v2c*h*h/3.;qp_cv=cp_cv/den;qv_cv=cv_cv/den;++cv_updates;}
     }
     // Reported/fallback densities: endpoint (native) candidate.
     q_alpha=qr_c[0];q_accel=qp_c[0];q_accel_velocity=qv_c[0];
