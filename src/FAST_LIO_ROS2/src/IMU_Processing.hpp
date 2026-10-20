@@ -23,6 +23,7 @@
 #include "GapProcessCovariance.hpp"
 #include "AdaptiveGapCovariance.hpp"
 #include "ImuOnlyGapLearning.hpp"
+#include "RotationCausalReplay.hpp"
 
 /// *************Preconfiguration
 
@@ -59,6 +60,7 @@ class ImuProcess
   ofstream fout_imu;
   AdaptiveGapCovariance gap_adaptive;
   ImuOnlyGapLearning gap_imu_only;
+  RotationCausalReplay rotation_causal_replay;
   std::vector<std::pair<double,double>> gap_imu_only_pending;
   std::string gap_block_mode = "full";
   std::ofstream gap_applied_log;
@@ -71,6 +73,52 @@ class ImuProcess
   // per channel the candidate input (endpoint or window mean) with the smallest
   // learned dynamics error + per-sample noise / actual sample count.
   bool gap_input_adaptive = false;
+  // Logging only (default off, no effect on the estimate): at each gap step also print the discrete process-noise
+  // covariance FAST-LIO adds, Qd = (dt G) Q (dt G)^T, the propagation change F P F^T - P, and the learned dP,
+  // as block traces (rotation / velocity / position), plus the scan end time.
+  bool gap_log_q_split = false;
+  // v10 (default off): dropout-only covariance model. Dense IMU steps keep FAST-LIO's P = F P F^T + (dt G) Q (dt G)^T.
+  // On a gap step (h >= gap_min_seconds, learner ready):  P = F_gap P F_gap^T + Q_bias(h) + Q_endpoint(h) + Q_motion(h)
+  //   F_gap: FAST-LIO F with the velocity rows decoupled from attitude, accel bias and gravity (the CV fill does not
+  //          integrate the accelerometer, so the predicted velocity does not depend on them);
+  //   Q_bias: FAST-LIO's bias random-walk term (unchanged); the gyro/accel measurement-noise terms are NOT added;
+  //   rotation Q_endpoint + Q_motion = (rot_a h^2 + rot_b h^3)/3 I, two-term fit from the virtual gaps;
+  //   velocity/position Q_motion = learned CV dP (no endpoint term: the CV fill uses no accel sample).
+  // Before the learner is ready the standard FAST-LIO step is used (never zero Q with zero dP).
+  bool gap_v10 = false;
+  // v10 ablations (default off). fixed: same structure, fixed coefficients (rot_a h^2 + rot_b h^3 rotation, discrete(h,0,qc)
+  // velocity/position), applied from the first gap, learner not used for dP. oldq: F_gap but FAST-LIO's full Q and the
+  // F4CSF dP (endpoint-average learned q_alpha h^3, learned CV qc) -> isolates the new F_gap.
+  // oldf: v10 noise model (bias Q + learned endpoint/motion terms) but FAST-LIO's original F (no velocity decoupling).
+  bool gap_v10_oldf = false;
+  // rotold: F_gap + v10 translational noise, but FAST-LIO's rotation noise (gyr_cov h^2) and the F4CSF rotation dP (analysis mix).
+  bool gap_v10_rotold = false;
+  // transold: F_gap + v10 rotation noise (learned two-term), but FAST-LIO's accel noise (acc_cov h^2 -> velocity) plus the
+  // F4CSF velocity/position dP (analysis mix, mirror of rotold).
+  bool gap_v10_transold = false;
+  // condrot: v10, but the rotation term is the gyro-magnitude-conditioned (c0 + c1 s^2) h^2 / 3 per axis, s = mean of the
+  // head/tail |w| of this hidden interval, learned from dense virtual gaps (ImuOnlyGapLearning::cond_rot). Until its first
+  // update the v10 two-term rotation is used.
+  bool gap_v10_cond_rot = false; bool cond_used_last_ = false; double cond_s_last_ = 0.;
+  bool gap_v10_fixed = false, gap_v10_oldq = false; double gap_v10_fixed_rot_a = 0., gap_v10_fixed_rot_b = 0., gap_v10_fixed_qc = 0.;
+  // Per-scan linear attribution of the prior covariance growth (logging only): each source is propagated with the same
+  // transition F until the LiDAR update. qn = Q added on dense IMU steps (dt <= gap_input_min_dt), qs = Q added on
+  // sparse/gap/long-extrapolation steps, dp = injected gap dP. prior P = F_total P_post F_total^T + qn + qs + dp.
+  Eigen::Matrix<double, 23, 23> split_qn_ = Eigen::Matrix<double, 23, 23>::Zero(), split_qs_ = Eigen::Matrix<double, 23, 23>::Zero(),
+                                split_dp_ = Eigen::Matrix<double, 23, 23>::Zero();
+  int split_gap_steps_ = 0;
+  void splitPropagate(const Eigen::Matrix<double, 23, 23> &F, const Eigen::Matrix<double, 23, 23> &Qd, double dt) {
+    split_qn_ = F * split_qn_ * F.transpose(); split_qs_ = F * split_qs_ * F.transpose(); split_dp_ = F * split_dp_ * F.transpose();
+    if (std::abs(dt) <= gap_input_min_dt) split_qn_ += Qd; else split_qs_ += Qd;
+  }
+  // Cold-start gap covariance (default off = unchanged). Before/while the virtual-gap learner has few samples, the
+  // gap dP is the Bayesian posterior-mean blend of a physical model and the learned dP:
+  //   cold model: unobserved world acceleration constant over the gap and uniform in the ball |a| <= a_max
+  //     (max-entropy for a bound) -> per-axis var a_max^2/5:  vv = s2 h^2, pp = s2 h^4/4, vp = s2 h^3/2;
+  //     rotation with |dw/dt| <= alpha_max around the endpoint-average fill: |e| <= alpha h^2/4, uniform -> alpha^2 h^4/48.
+  //   weight of the cold model = (alpha0-1)/(alpha0-1 + 1.5 n_eff)  (inverse-gamma prior with shape alpha0 on a
+  //     3-dof variance; n_eff = learner's effective sample count). alpha0 = 2: weakest prior with finite mean/variance.
+  bool gap_cold_start = false; double gap_cold_acc_max = 0., gap_cold_angacc_max = 0., gap_cold_alpha0 = 2., gap_cold_weight_last = 0.;
   // LiDAR constant-velocity deskew fallback: when the IMU samples inside a scan leave a gap
   // longer than deskew_cv_max_imu_gap, deskew with the body angular/linear velocity of the
   // last two LiDAR-corrected states instead of the IMU poses (sparse or mistimed IMU).
@@ -580,6 +628,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
   // cout<<"[ IMU Process ]: Process lidar from "<<pcl_beg_time<<" to "<<pcl_end_time<<", " \
   //          <<meas.imu.size()<<" imu msgs from "<<imu_beg_time<<" to "<<imu_end_time<<endl;
 
+  if (gap_log_q_split) { split_qn_.setZero(); split_qs_.setZero(); split_dp_.setZero(); split_gap_steps_ = 0; }
   /*** Initialize IMU pose ***/
   state_ikfom imu_state = kf_state.get_x();
   IMUpose.clear();
@@ -657,24 +706,80 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
       dt = tail_stamp - head_stamp;
     }
     
+    rotation_causal_replay.apply(head_stamp, tail_stamp, dt, kf_state.get_x().bg, angvel_avr);
     in.acc = acc_avr;
     in.gyro = angvel_avr;
     Q.block<3, 3>(0, 0).diagonal() = cov_gyr * imu_trust_scale;
     Q.block<3, 3>(3, 3).diagonal() = cov_acc * imu_trust_scale;
     Q.block<3, 3>(6, 6).diagonal() = cov_bias_gyr;
     Q.block<3, 3>(9, 9).diagonal() = cov_bias_acc;
-    if (gap_adaptive.enabled) {
+    const bool log_split = gap_log_q_split && gap_covariance_enable && tail_stamp - head_stamp >= gap_min_seconds && dt > 0.;
+    Eigen::Matrix<double, 23, 23> P_before_split, Qd_split = Eigen::Matrix<double, 23, 23>::Zero();
+    if (log_split) P_before_split = kf_state.get_P();
+    const bool v10_step = gap_v10 && gap_covariance_enable && tail_stamp - head_stamp >= gap_min_seconds && dt > 0. &&
+                          (gap_v10_fixed || (gap_imu_only.enabled && gap_imu_only.ready() && gap_imu_only.rot_fit_updates > 0));
+    if (v10_step) {
+      const Eigen::Matrix<double, 23, 23> P0 = kf_state.get_P();
+      Eigen::Matrix<double, 12, 12> Qb = Eigen::Matrix<double, 12, 12>::Zero();
+      Qb.block<6, 6>(6, 6) = Q.block<6, 6>(6, 6);                 // bias random walk only
+      if (gap_v10_oldq) Qb = Q;                                   // ablation: keep FAST-LIO's full Q
+      if (gap_v10_rotold) Qb.block<3, 3>(0, 0) = Q.block<3, 3>(0, 0);   // ablation: FAST-LIO gyro noise -> rotation
+      if (gap_v10_transold) Qb.block<3, 3>(3, 3) = Q.block<3, 3>(3, 3); // ablation: FAST-LIO accel noise -> velocity
+      gap_covariance::Mat23 Fs;
+      Eigen::Matrix<double, 23, 12> Gs;
+      kf_state.predict(dt, Qb, in, &Fs, &Gs);                      // mean propagation; covariance set below
+      if (!gap_v10_oldf) {
+        Fs.block<3, 3>(12, 3).setZero();                          // vel <- attitude
+        Fs.block<3, 3>(12, 18).setZero();                         // vel <- accel bias
+        Fs.block<3, 2>(12, 21).setZero();                         // vel <- gravity
+      }
+      const Eigen::Matrix<double, 23, 23> Qd = Gs * Qb * Gs.transpose();
+      esekfom::esekf<state_ikfom, 12, input_ikfom>::cov Pg = Fs * P0 * Fs.transpose() + Qd;
+      kf_state.change_P(Pg);
+      if (gap_log_q_split) { P_before_split = P0; Qd_split = Qd; splitPropagate(Fs, Qd, dt); }
+    } else if (gap_adaptive.enabled) {
       gap_covariance::Mat23 F;
       Eigen::Matrix<double,23,12> G;
       kf_state.predict(dt,Q,in,&F,&G);
       gap_adaptive.predict(F,G);
+    } else if (gap_log_q_split) {
+      gap_covariance::Mat23 Fs;
+      Eigen::Matrix<double,23,12> Gs;                       // = dt * f_w_final
+      kf_state.predict(dt, Q, in, &Fs, &Gs);
+      Qd_split = Gs * Q * Gs.transpose();
+      splitPropagate(Fs, Qd_split, dt);
     } else kf_state.predict(dt, Q, in);
     // Experimental completed-gap injection. The interval is processed once:
     // dt is clipped to the last propagated LiDAR end, not record/header lag.
     // This hold-model approximation is NOT calibrated for endpoint averaging.
     if (gap_covariance_enable && tail_stamp-head_stamp >= gap_min_seconds && dt > 0.) {
-      const auto added = gap_covariance::embedFastLio(
-          gap_covariance::selectBlocks(gap_covariance::discrete(dt, interval_q_alpha, interval_q_accel),gap_block_mode));
+      gap_covariance::Mat9 dp9 = gap_covariance::selectBlocks(gap_covariance::discrete(dt, interval_q_alpha, interval_q_accel),gap_block_mode);
+      if (gap_cold_start) {
+        const double h = dt, s2a = gap_cold_acc_max * gap_cold_acc_max / 5.;
+        gap_covariance::Mat9 cold = gap_covariance::Mat9::Zero();
+        cold.block<3,3>(0,0) = Eigen::Matrix3d::Identity() * gap_cold_angacc_max * gap_cold_angacc_max * std::pow(h, 4) / 48.;
+        cold.block<3,3>(3,3) = Eigen::Matrix3d::Identity() * s2a * h * h;
+        cold.block<3,3>(6,6) = Eigen::Matrix3d::Identity() * s2a * std::pow(h, 4) / 4.;
+        cold.block<3,3>(3,6) = Eigen::Matrix3d::Identity() * s2a * std::pow(h, 3) / 2.;
+        cold.block<3,3>(6,3) = cold.block<3,3>(3,6);
+        const double w = (gap_cold_alpha0 - 1.) / (gap_cold_alpha0 - 1. + 1.5 * gap_imu_only.n_eff);
+        gap_cold_weight_last = w;
+        dp9 = w * gap_covariance::selectBlocks(cold, gap_block_mode) + (1. - w) * dp9;
+      }
+      if (v10_step && gap_v10_fixed) {                            // ablation: same structure, fixed coefficients
+        const auto vp = gap_covariance::discrete(dt, Eigen::Matrix3d::Zero(), Eigen::Matrix3d::Identity() * gap_v10_fixed_qc);
+        dp9 = gap_covariance::selectBlocks(vp, gap_block_mode);
+        dp9.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity() * (gap_v10_fixed_rot_a * dt * dt + gap_v10_fixed_rot_b * dt * dt * dt) / 3.;
+      } else if (v10_step && !gap_v10_oldq && !gap_v10_rotold) {  // rotation: endpoint + motion two-term model
+        cond_used_last_ = gap_v10_cond_rot && gap_imu_only.cond_updates > 0;
+        cond_s_last_ = 0.5 * (V3D(head->angular_velocity.x, head->angular_velocity.y, head->angular_velocity.z).norm() +
+                              V3D(tail->angular_velocity.x, tail->angular_velocity.y, tail->angular_velocity.z).norm());
+        if (cond_used_last_)                                      // condrot: gyro-magnitude-conditioned rotation
+          dp9.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity() * gap_imu_only.condRot(dt, cond_s_last_) / 3.;
+        else
+          dp9.block<3, 3>(0, 0) = Eigen::Matrix3d::Identity() * (gap_imu_only.rot_a * dt * dt + gap_imu_only.rot_b * dt * dt * dt) / 3.;
+      }
+      const auto added = gap_covariance::embedFastLio(dp9);
       if(gap_applied_log) {
         gap_applied_log<<std::setprecision(17)<<head_stamp<<','<<tail_stamp<<','<<dt<<','<<gap_block_mode;
         for(int i=0;i<3;++i)gap_applied_log<<','<<interval_q_alpha(i,i);
@@ -686,6 +791,7 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
         covariance += added;
         kf_state.change_P(covariance);
       }
+      if (gap_log_q_split) { ++split_gap_steps_; if (gap_covariance_inject) split_dp_ += added; }
       gap_adaptive.addGap(dt);
       if(gap_imu_only.enabled) gap_imu_only_pending.emplace_back(dt,tail_stamp);
       std::cout << "GAP_DP head=" << std::setprecision(17) << head_stamp
@@ -693,7 +799,20 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
                 << " theta_trace=" << added.block<3,3>(3,3).trace()
                 << " velocity_trace=" << added.block<3,3>(12,12).trace()
                 << " position_trace=" << added.block<3,3>(0,0).trace()
-                << " input=" << gap_input << std::endl;
+                << " input=" << gap_input;
+      if (log_split) {
+        const Eigen::Matrix<double, 23, 23> prop = kf_state.get_P() - added - P_before_split - Qd_split;   // F P F^T - P
+        std::cout << " qd_rot=" << Qd_split.block<3,3>(3,3).trace() << " qd_vel=" << Qd_split.block<3,3>(12,12).trace()
+                  << " qd_pos=" << Qd_split.block<3,3>(0,0).trace() << " prop_rot=" << prop.block<3,3>(3,3).trace()
+                  << " prop_vel=" << prop.block<3,3>(12,12).trace() << " prop_pos=" << prop.block<3,3>(0,0).trace()
+                  << " inject=" << gap_covariance_inject << " pcl_end=" << pcl_end_time;
+      }
+      if (gap_cold_start) std::cout << " cold_w=" << gap_cold_weight_last;
+      if (gap_v10) std::cout << " v10=" << v10_step << (gap_v10_fixed ? " fixed" : "") << (gap_v10_oldq ? " oldq" : "") << (gap_v10_oldf ? " oldf" : "") << (gap_v10_rotold ? " rotold" : "") << (gap_v10_transold ? " transold" : "")
+                             << " rot_a=" << gap_imu_only.rot_a << " rot_b=" << gap_imu_only.rot_b;
+      if (gap_v10_cond_rot) std::cout << " condrot=" << cond_used_last_ << " s=" << cond_s_last_ << " c0=" << gap_imu_only.cond_c0
+                                      << " c1=" << gap_imu_only.cond_c1 << " cond_n=" << gap_imu_only.cond_updates;
+      std::cout << std::endl;
     }
 
     /* save the poses at each IMU measurements */
@@ -743,7 +862,22 @@ void ImuProcess::UndistortPcl(const MeasureGroup &meas, esekfom::esekf<state_ikf
     Eigen::Matrix<double,23,12> G;
     kf_state.predict(dt,Q,in,&F,&G);
     gap_adaptive.predict(F,G);
+  } else if (gap_log_q_split) {
+    gap_covariance::Mat23 Fs;
+    Eigen::Matrix<double,23,12> Gs;
+    kf_state.predict(dt, Q, in, &Fs, &Gs);
+    splitPropagate(Fs, Gs * Q * Gs.transpose(), dt);
   } else kf_state.predict(dt, Q, in);
+  if (gap_log_q_split) {
+    const auto P = kf_state.get_P();
+    auto tr = [](const Eigen::Matrix<double, 23, 23> &M, int i) { return M.block<3,3>(i,i).trace(); };
+    std::cout << std::setprecision(10) << "COV_SPLIT end=" << std::setprecision(17) << pcl_end_time << std::setprecision(10)
+              << " gap_steps=" << split_gap_steps_ << " extrap_dt=" << dt
+              << " qn_rot=" << tr(split_qn_,3) << " qn_vel=" << tr(split_qn_,12) << " qn_pos=" << tr(split_qn_,0)
+              << " qs_rot=" << tr(split_qs_,3) << " qs_vel=" << tr(split_qs_,12) << " qs_pos=" << tr(split_qs_,0)
+              << " dp_rot=" << tr(split_dp_,3) << " dp_vel=" << tr(split_dp_,12) << " dp_pos=" << tr(split_dp_,0)
+              << " prior_rot=" << tr(P,3) << " prior_vel=" << tr(P,12) << " prior_pos=" << tr(P,0) << std::endl;
+  }
   
   imu_state = kf_state.get_x();
   last_imu_ = meas.imu.back();

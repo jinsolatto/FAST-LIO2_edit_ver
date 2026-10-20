@@ -34,6 +34,29 @@ public:
   // current gravity-in-body and accel bias (roll/pitch assumed constant over <= max_h).
   bool learn_cv=false; Eigen::Vector3d cv_g_body=Eigen::Vector3d::Zero(), cv_ba=Eigen::Vector3d::Zero();
   double qp_cv=0., qv_cv=0., cp_cv=0., cv_cv=0.; size_t cv_updates=0;
+  // Learner fixes (default off = unchanged).
+  // skip_static: a virtual gap whose whole window is stationary (|w| < static_w and ||a|-g| < static_a for every
+  //   sample) is not learned; a stationary start otherwise seeds near-zero densities that persist under sparse IMU.
+  // short_h: when the target horizon does not fit the current dense run, learn on the longest window that does
+  //   (>= short_min); densities are h^3-normalized, so shorter windows estimate the same q.
+  bool skip_static=false; double static_w=.05, static_a=.15; size_t static_skipped=0;
+  bool short_h=false; double short_min=.08; size_t short_used=0;
+  // Effective number of learned samples under the same discounting as the moment estimates (0 before the first
+  // update); used by the cold-start blend in IMU_Processing.
+  double n_eff=0.;
+  // v10: two-term fit of the endpoint-average ROTATION error over virtual gaps, |e|^2 ~ rot_a h^2 + rot_b h^3
+  // (rot_a: endpoint-sample noise held over the gap, rot_b: unobserved angular-rate change). Same EMA weights.
+  double rot_a=0., rot_b=0.; size_t rot_fit_updates=0;
+  double s44=0., s45=0., s66=0., sr2=0., sr3=0.;
+  void fitRotTwoTerm(){
+    const double det=s44*s66-s45*s45;
+    double A=0., B=0.;
+    if(det>1e-12*std::max(s44*s66,1e-300)){A=(sr2*s66-sr3*s45)/det;B=(s44*sr3-s45*sr2)/det;}
+    else{A=0.;B=s66>0?sr3/s66:0.;}
+    if(A<0.){A=0.;B=s66>0?sr3/s66:0.;}
+    if(B<0.){B=0.;A=s44>0?sr2/s44:0.;}
+    rot_a=A;rot_b=B;
+  }
   double noise_gyr=0.,noise_acc=0.;   // per-axis per-sample variance
   // true: noise from successive-sample differences (var(x_{k+1}-x_k)/2), which is insensitive
   // to real motion between 5 ms samples; false: spread about the window mean (includes motion).
@@ -62,8 +85,17 @@ public:
     horizons.push_back(h);if(horizons.size()>128)horizons.pop_front();
     note(timestamp,"actual_gap_accepted",h);
   }
+  // cond_rot (default off): gyro-magnitude-conditioned rotation model |e|^2 ~ (cond_c0 + cond_c1 s^2) h^2,
+  //   s = mean of the two endpoint |w|. Learned from a DENSE set of virtual gaps of the received stream: in every
+  //   dense run, windows of each length in cond_h starting every cond_stride s (left margin), accepted once a sample
+  //   >= margin past the window end has arrived; static windows skipped. EMA time of a window = its end + margin.
+  //   Separate accumulators: the existing learner (rot_a/rot_b, dP, inputs) is unchanged.
+  bool cond_rot=false; double cond_stride=.05; std::vector<double> cond_h{.08,.12,.16,.20,.25,.30};
+  double cond_c0=0., cond_c1=0.; size_t cond_updates=0;
+  double condRot(double h,double s) const {return (cond_c0+cond_c1*s*s)*h*h;}
   void push(const Sample& s) {
     if(!enabled)return;
+    if(cond_rot)condPush(s);
     if(!std::isfinite(s.t)||!s.w.allFinite()||!s.a.allFinite()){
       history.clear();++breaks;note(s.t,"nonfinite_input",0);return;
     }
@@ -89,12 +121,24 @@ public:
     while(end>0 && s.t-history[end].t<margin)--end;
     int start=end;
     while(start>0 && history[end].t-history[start].t<target)--start;
-    if(start<1 || end-start<3 || history[start].t-history.front().t<margin){note(s.t,"insufficient_history",target);return;}
+    if(start<1 || end-start<3 || history[start].t-history.front().t<margin){
+      if(!short_h){note(s.t,"insufficient_history",target);return;}
+      start=1;   // short_h: longest window in the current dense run that keeps the left margin
+      while(start<end && history[start].t-history.front().t<margin)++start;
+      if(end-start<3 || history[end].t-history[start].t<short_min){note(s.t,"insufficient_history",target);return;}
+      ++short_used;
+    }
     // Nearest ORIGINAL starting sample; no synthetic timestamp/measurement.
-    if(start+1<end && std::abs(history[end].t-history[start+1].t-target)<std::abs(history[end].t-history[start].t-target))++start;
+    else if(start+1<end && std::abs(history[end].t-history[start+1].t-target)<std::abs(history[end].t-history[start].t-target))++start;
     double h=history[end].t-history[start].t;
     if(h<min_h||h>max_h||end-start<3){note(s.t,"unsupported_window",target);return;}
     double h3=h*h*h;
+    if(skip_static){
+      bool moving=false;
+      for(int k=start;k<=end && !moving;++k)
+        moving=history[k].w.norm()>=static_w || std::abs(history[k].a.norm()-9.81)>=static_a;
+      if(!moving){++static_skipped;note(s.t,"static_window",h);return;}
+    }
     if(adaptive_input){learnAdaptive(s.t,target,start,end,h,h3);return;}
     state_ikfom ref,hold; // identity local frame, zero biases/velocity, same gravity
     ref.pos.setZero();ref.vel.setZero();ref.bg.setZero();ref.ba.setZero();hold=ref;
@@ -120,6 +164,54 @@ public:
     if(log){log<<s.t<<",accepted,"<<target<<','<<h<<','<<history[start].t<<','<<history[end].t<<','<<end-start+1<<','<<largest<<','<<r2<<','<<v2<<','<<p2<<','<<r2/h3<<','<<p2/h3<<','<<v2/(3*h)<<','<<q_alpha<<','<<q_accel<<','<<q_accel_velocity<<','<<accepted<<','<<breaks<<','<<horizons.size()<<",nan,nan,,\n";log.flush();}
   }
 private:
+  std::deque<Sample> crun; std::vector<double> cstart; std::vector<bool> cdone;
+  double cP[5]={0,0,0,0,0}, clast=0.;
+  void condPush(const Sample& s){
+    if(!std::isfinite(s.t)||!s.w.allFinite()||!s.a.allFinite()){crun.clear();return;}
+    if(!crun.empty()){const double dt=s.t-crun.back().t;if(dt<=0||dt>max_dt)crun.clear();}
+    if(crun.empty()){cdone.assign(cond_h.size(),false);cstart.assign(cond_h.size(),s.t+margin);} // left margin
+    crun.push_back(s);
+    const size_t n=crun.size();const double tl=s.t;
+    auto firstAt=[&](double t){size_t i=0;while(i<n&&crun[i].t<t)++i;return i;};   // first index with time >= t
+    struct W{double t,h,e2,s;};std::vector<W> ready;
+    for(size_t c=0;c<cond_h.size();++c){
+      while(!cdone[c]){
+        const size_t j=firstAt(cstart[c]);if(j>=n)break;                 // start sample not received yet
+        const size_t k=firstAt(crun[j].t+cond_h[c]);
+        if(k>=n||tl-crun[k].t<margin)break;                              // end (and its right margin) not yet known
+        if(k-j<4){cdone[c]=true;break;}
+        bool moving=!skip_static;
+        for(size_t i=j;i<=k&&!moving;++i)moving=crun[i].w.norm()>=static_w||std::abs(crun[i].a.norm()-9.81)>=static_a;
+        if(moving){
+          Eigen::Matrix3d R=Eigen::Matrix3d::Identity();
+          for(size_t i=j;i<k;++i){const Eigen::Vector3d r=.5*(crun[i].w+crun[i+1].w)*(crun[i+1].t-crun[i].t);
+            const double th=r.norm();if(th>1e-12)R=R*Eigen::AngleAxisd(th,r/th).toRotationMatrix();}
+          const double h=crun[k].t-crun[j].t;const Eigen::Vector3d rf=.5*(crun[j].w+crun[k].w)*h;
+          Eigen::Matrix3d F=Eigen::Matrix3d::Identity();if(rf.norm()>1e-12)F=Eigen::AngleAxisd(rf.norm(),rf/rf.norm()).toRotationMatrix();
+          const double e=Eigen::AngleAxisd(F.transpose()*R).angle();
+          if(std::isfinite(e))ready.push_back({crun[k].t+margin,h,e*e,.5*(crun[j].w.norm()+crun[k].w.norm())});
+        }
+        cstart[c]=crun[j].t+cond_stride;
+      }
+    }
+    std::sort(ready.begin(),ready.end(),[](const W&x,const W&y){return x.t<y.t;});
+    for(const auto& w:ready){
+      const double a=cond_updates?std::max(std::exp(-std::max(0.,w.t-clast)/tau),1.-cadence/tau):0.;clast=std::max(clast,w.t);
+      const double h2=w.h*w.h,h4=h2*h2,s2=w.s*w.s,b=1-a;
+      cP[0]=a*cP[0]+b*h4;cP[1]=a*cP[1]+b*s2*h4;cP[2]=a*cP[2]+b*s2*s2*h4;cP[3]=a*cP[3]+b*w.e2*h2;cP[4]=a*cP[4]+b*w.e2*s2*h2;
+      // same 2x2 normal equations and non-negative fallbacks as fitRotTwoTerm
+      const double det=cP[0]*cP[2]-cP[1]*cP[1];double A=0.,B=0.;
+      if(det>1e-12*std::max(cP[0]*cP[2],1e-300)){A=(cP[3]*cP[2]-cP[4]*cP[1])/det;B=(cP[0]*cP[4]-cP[1]*cP[3])/det;}
+      else{A=0.;B=cP[2]>0?cP[4]/cP[2]:0.;}
+      if(A<0.){A=0.;B=cP[2]>0?cP[4]/cP[2]:0.;}
+      if(B<0.){B=0.;A=cP[0]>0?cP[3]/cP[0]:0.;}
+      cond_c0=A;cond_c1=B;++cond_updates;
+    }
+    double oldest=tl;bool pending=false;                                 // drop samples no pending window can use
+    for(size_t c=0;c<cond_h.size();++c)if(!cdone[c]){oldest=std::min(oldest,cstart[c]);pending=true;}
+    if(!pending)oldest=tl;
+    while(crun.size()>1&&crun.front().t<oldest-1e-9)crun.pop_front();
+  }
   std::deque<Sample> recent;
   std::vector<double> cr,cp,cv;double nsg=0,nsa=0;
   void learnAdaptive(double now,double target,int start,int end,double h,double h3){
@@ -165,11 +257,15 @@ private:
     // After a long silence a time-decay EMA would hand one sample the full weight;
     // cap each update's weight at that of one dense-cadence update.
     double a=ready()?std::max(std::exp(-(now-last_update)/tau),1.-cadence/tau):0.;
+    n_eff=a*n_eff+1.;
     den=a*den+(1-a)*h3;nsg=a*nsg+(1-a)*vg;nsa=a*nsa+(1-a)*va;noise_gyr=nsg;noise_acc=nsa;
     for(size_t c=0;c<K;++c){
       cr[c]=a*cr[c]+(1-a)*r2[c];cp[c]=a*cp[c]+(1-a)*p2[c];cv[c]=a*cv[c]+(1-a)*v2[c]*h*h/3.;
       qr_c[c]=cr[c]/den;qp_c[c]=cp[c]/den;qv_c[c]=cv[c]/den;
     }
+    {const double h2=h*h,h4=h2*h2;
+     s44=a*s44+(1-a)*h4;s45=a*s45+(1-a)*h4*h;s66=a*s66+(1-a)*h3*h3;sr2=a*sr2+(1-a)*r2[0]*h2;sr3=a*sr3+(1-a)*r2[0]*h3;
+     fitRotTwoTerm();++rot_fit_updates;}
     if(learn_cv){
       Eigen::Matrix3d R=Eigen::Matrix3d::Identity();Eigen::Vector3d v=Eigen::Vector3d::Zero(),p=Eigen::Vector3d::Zero();
       for(int k=start;k<end;++k){

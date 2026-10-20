@@ -2273,6 +2273,66 @@ public:
         p_imu->gap_dp_fixed = this->declare_parameter<bool>("mapping.gap_dp_fixed", false);
         p_imu->gap_imu_only.learn_cv = this->declare_parameter<bool>("mapping.gap_learn_cv", false);
         if (p_imu->gap_imu_only.learn_cv) RCLCPP_WARN(this->get_logger(), "LEARN CV: dP for the constant-velocity fill is learned from its own virtual-gap error");
+        p_imu->gap_imu_only.skip_static = this->declare_parameter<bool>("mapping.gap_learn_skip_static", false);
+        p_imu->gap_imu_only.static_w = this->declare_parameter<double>("mapping.gap_learn_static_w", 0.05);
+        p_imu->gap_imu_only.static_a = this->declare_parameter<double>("mapping.gap_learn_static_a", 0.15);
+        p_imu->gap_imu_only.short_h = this->declare_parameter<bool>("mapping.gap_learn_short_h", false);
+        p_imu->gap_imu_only.short_min = this->declare_parameter<double>("mapping.gap_learn_short_min", 0.08);
+        if (p_imu->gap_imu_only.skip_static)
+            RCLCPP_WARN(this->get_logger(), "LEARN SKIP STATIC: stationary virtual gaps not learned (|w|<%.3f rad/s, ||a|-g|<%.3f m/s^2)",
+                        p_imu->gap_imu_only.static_w, p_imu->gap_imu_only.static_a);
+        if (p_imu->gap_imu_only.short_h)
+            RCLCPP_WARN(this->get_logger(), "LEARN SHORT H: learn on the longest dense window (>= %.3f s) when the target horizon does not fit",
+                        p_imu->gap_imu_only.short_min);
+        p_imu->gap_cold_start = this->declare_parameter<bool>("mapping.gap_cold_start", false);
+        p_imu->gap_cold_acc_max = this->declare_parameter<double>("mapping.gap_cold_acc_max", 0.0);
+        p_imu->gap_cold_angacc_max = this->declare_parameter<double>("mapping.gap_cold_angacc_max", 0.0);
+        p_imu->gap_cold_alpha0 = this->declare_parameter<double>("mapping.gap_cold_alpha0", 2.0);
+        if (p_imu->gap_cold_start) {
+            if (!(p_imu->gap_cold_acc_max > 0 && p_imu->gap_cold_angacc_max > 0 && p_imu->gap_cold_alpha0 > 1))
+                throw std::invalid_argument("gap_cold_start needs acc_max > 0, angacc_max > 0, alpha0 > 1");
+            RCLCPP_WARN(this->get_logger(), "COLD START: physical gap dP (a_max %.2f m/s^2, alpha_max %.2f rad/s^2) blended with learned dP, prior shape alpha0 %.1f",
+                        p_imu->gap_cold_acc_max, p_imu->gap_cold_angacc_max, p_imu->gap_cold_alpha0);
+        }
+        p_imu->gap_log_q_split = this->declare_parameter<bool>("mapping.gap_log_q_split", false);
+        p_imu->gap_v10 = this->declare_parameter<bool>("mapping.gap_v10", false);
+        p_imu->gap_v10_fixed = this->declare_parameter<bool>("mapping.gap_v10_fixed", false);
+        p_imu->gap_v10_oldq = this->declare_parameter<bool>("mapping.gap_v10_oldq", false);
+        p_imu->gap_v10_oldf = this->declare_parameter<bool>("mapping.gap_v10_oldf", false);
+        p_imu->gap_v10_rotold = this->declare_parameter<bool>("mapping.gap_v10_rotold", false);
+        p_imu->gap_v10_transold = this->declare_parameter<bool>("mapping.gap_v10_transold", false);
+        if (p_imu->gap_v10_transold && (p_imu->gap_v10_oldq || p_imu->gap_v10_fixed || p_imu->gap_v10_rotold)) throw std::invalid_argument("gap_v10_transold excludes oldq/fixed/rotold");
+        if (p_imu->gap_v10_transold) RCLCPP_WARN(this->get_logger(), "V10-TRANSOLD: F_gap, v10 rotation noise, FAST-LIO accel noise + F4CSF translational dP (analysis mix)");
+        p_imu->gap_v10_cond_rot = this->declare_parameter<bool>("mapping.gap_v10_cond_rot", false);
+        p_imu->gap_imu_only.cond_rot = p_imu->gap_v10_cond_rot;
+        p_imu->gap_imu_only.cond_stride = this->declare_parameter<double>("mapping.gap_v10_cond_stride", 0.05);
+        if (p_imu->gap_v10_cond_rot && (!p_imu->gap_v10 || p_imu->gap_v10_fixed || p_imu->gap_v10_oldq || p_imu->gap_v10_rotold)) throw std::invalid_argument("gap_v10_cond_rot needs gap_v10 and excludes fixed/oldq/rotold");
+        if (p_imu->gap_v10_cond_rot) RCLCPP_WARN(this->get_logger(), "V10-CONDROT: rotation noise (c0 + c1 s^2) h^2 learned from dense virtual gaps (stride %.3f s), s = mean endpoint |w|", p_imu->gap_imu_only.cond_stride);
+        if (p_imu->gap_v10_rotold && (p_imu->gap_v10_oldq || p_imu->gap_v10_fixed)) throw std::invalid_argument("gap_v10_rotold excludes oldq/fixed");
+        if (p_imu->gap_v10_rotold) RCLCPP_WARN(this->get_logger(), "V10-ROTOLD: F_gap, FAST-LIO rotation noise + F4CSF rotation dP, v10 translational noise (analysis mix)");
+        if (p_imu->gap_v10_oldf && p_imu->gap_v10_oldq) throw std::invalid_argument("gap_v10_oldf and gap_v10_oldq are exclusive");
+        if (p_imu->gap_v10_oldf) RCLCPP_WARN(this->get_logger(), "V10-OLDF: v10 noise model with FAST-LIO's original F (analysis combination)");
+        p_imu->gap_v10_fixed_rot_a = this->declare_parameter<double>("mapping.gap_v10_fixed_rot_a", 0.0);
+        p_imu->gap_v10_fixed_rot_b = this->declare_parameter<double>("mapping.gap_v10_fixed_rot_b", 0.0);
+        p_imu->gap_v10_fixed_qc = this->declare_parameter<double>("mapping.gap_v10_fixed_qc", 0.0);
+        if (p_imu->gap_v10_fixed && p_imu->gap_v10_oldq) throw std::invalid_argument("gap_v10_fixed and gap_v10_oldq are exclusive");
+        if (p_imu->gap_v10_fixed)
+            RCLCPP_WARN(this->get_logger(), "V10-FIXED: rot_a %.4g rot_b %.4g qc %.4g (fixed coefficients, from the first gap)",
+                        p_imu->gap_v10_fixed_rot_a, p_imu->gap_v10_fixed_rot_b, p_imu->gap_v10_fixed_qc);
+        if (p_imu->gap_v10_oldq) RCLCPP_WARN(this->get_logger(), "V10-OLDQ: F_gap with FAST-LIO full Q and F4CSF dP");
+        if (p_imu->gap_v10) {
+            if (!p_imu->gap_imu_only.enabled || !p_imu->gap_imu_only.learn_cv)
+                throw std::invalid_argument("gap_v10 requires the IMU-only learner with gap_learn_cv");
+            RCLCPP_WARN(this->get_logger(), "V10: dropout-only covariance model (F_gap + bias Q + learned endpoint/motion terms); dense IMU steps unchanged");
+        }
+        // Fill/dP separation (default off = unchanged): the configured gap FILL (e.g. endpoint gyro + CV acc) is used
+        // from the first gap; only the learned dP waits for the learner (zero learned dP until its first update).
+        // Off: before the first learner update gaps use the native endpoint input.
+        if (this->declare_parameter<bool>("mapping.gap_fill_before_ready", false)) {
+            if (!p_imu->gap_imu_only.adaptive_input) throw std::invalid_argument("gap_fill_before_ready requires gap_imu_only_adaptive_input");
+            p_imu->gap_input_adaptive = true;
+            RCLCPP_WARN(this->get_logger(), "FILL BEFORE READY: configured gap fill used from the first gap; learned dP = 0 until the learner's first update");
+        }
         p_imu->gap_input_optimal_window = this->declare_parameter<bool>("mapping.gap_input_optimal_window", false);
         p_imu->gap_dp_from_window_mse = this->declare_parameter<bool>("mapping.gap_dp_from_window_mse", true);
         p_imu->ow_tau = this->declare_parameter<double>("mapping.gap_ow_tau", 5.0);
@@ -2859,6 +2919,15 @@ private:
             if(g_gap_consistency.enabled){
                 if(!g_gap_first_evaluation_logged)g_gap_consistency.unavailable();
                 g_gap_consistency.writePose("post",state_point,kf.get_P());
+            }
+            if (p_imu->gap_log_q_split) {   // logging only: LiDAR update effect (state change and covariance after update)
+                const auto Pu = kf.get_P();
+                std::cout << std::setprecision(17) << "UPD end=" << Measures.lidar_end_time << std::setprecision(10)
+                          << " dpos=" << (state_point.pos - gap_predicted_state.pos).norm()
+                          << " drot=" << Eigen::AngleAxisd((gap_predicted_state.rot.conjugate() * state_point.rot).toRotationMatrix()).angle()
+                          << " dvel=" << (state_point.vel - gap_predicted_state.vel).norm()
+                          << " post_rot=" << Pu.block<3,3>(3,3).trace() << " post_vel=" << Pu.block<3,3>(12,12).trace()
+                          << " post_pos=" << Pu.block<3,3>(0,0).trace() << std::endl;
             }
             // Analysis-only: POST RMSE at the true final state, only if the LiDAR
             // update actually ran this scan (g_h_share_calls_this_scan > 0).
